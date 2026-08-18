@@ -845,6 +845,29 @@ run_replot_analysis() {
     ok "Contrast: $RESOLVED_CONTRAST"
     blank
 
+    echo -e "  Effect-size estimate to use for this re-plot:"
+    echo -e "    ${CYAN}1${RESET}.  DiffBind shrunken Fold ${DIM}(default)${RESET}"
+    echo -e "        ${DIM}Stabilized estimate -- good for ranking peaks or general${RESET}"
+    echo -e "        ${DIM}exploration. Shrinkage strength depends on the same uncertainty${RESET}"
+    echo -e "        ${DIM}that drives significance, which can make effect size and${RESET}"
+    echo -e "        ${DIM}significance look more tightly related than they really are.${RESET}"
+    echo -e "    ${CYAN}2${RESET}.  DESeq2 MLE ${DIM}(unshrunken)${RESET}"
+    echo -e "        ${DIM}The actual coefficient the significance test evaluates. Noisier,${RESET}"
+    echo -e "        ${DIM}but the conventional volcano-plot choice, and avoids conflating a${RESET}"
+    echo -e "        ${DIM}regularized effect size with an unregularized test statistic.${RESET}"
+    echo -e "        ${DIM}Recommended for publication figures. Requires the diff_analysis.sh${RESET}"
+    echo -e "        ${DIM}run to have retrieved it (falls back to option 1 if unavailable).${RESET}"
+    blank
+    read -p "  Choice [1/2, default 1]: " LFC_CHOICE_INPUT
+    LFC_CHOICE_INPUT="${LFC_CHOICE_INPUT:-1}"
+    local USE_MLE_LFC=false
+    case "$LFC_CHOICE_INPUT" in
+        2) USE_MLE_LFC=true;  ok "Using DESeq2 MLE (unshrunken) log2FoldChange." ;;
+        *) USE_MLE_LFC=false; ok "Using DiffBind's shrunken Fold." ;;
+    esac
+    local USE_MLE_LFC_R
+    USE_MLE_LFC_R=$($USE_MLE_LFC && echo "TRUE" || echo "FALSE")
+
     echo -e "  Original run thresholds:  FDR < ${BUNDLE_FDR}  |  |log2FC| ≥ ${BUNDLE_FC}"
     echo -e "  ${DIM}Enter new values to override, or press Enter to keep the originals.${RESET}"
     blank
@@ -859,6 +882,30 @@ run_replot_analysis() {
 
     ok "Using FDR < $NEW_FDR  |  |log2FC| ≥ $NEW_FC"
 
+    read -p "  Volcano Y-axis max (-log10 padj) [default: automatic]: " NEW_Y_MAX
+    if [[ -n "$NEW_Y_MAX" ]]; then
+        if [[ "$NEW_Y_MAX" =~ ^[0-9]*\.?[0-9]+$ ]] && awk "BEGIN{exit !($NEW_Y_MAX > 0)}"; then
+            ok "Y-axis capped at $NEW_Y_MAX"
+        else
+            warn "Invalid — using automatic Y-axis scaling."
+            NEW_Y_MAX=""
+        fi
+    fi
+    local Y_MAX_R
+    Y_MAX_R="${NEW_Y_MAX:-NA}"
+
+    read -p "  Volcano X-axis max (|log2FC|) [default: automatic, symmetric]: " NEW_X_MAX
+    if [[ -n "$NEW_X_MAX" ]]; then
+        if [[ "$NEW_X_MAX" =~ ^[0-9]*\.?[0-9]+$ ]] && awk "BEGIN{exit !($NEW_X_MAX > 0)}"; then
+            ok "X-axis capped at ±$NEW_X_MAX"
+        else
+            warn "Invalid — using automatic (symmetric) X-axis scaling."
+            NEW_X_MAX=""
+        fi
+    fi
+    local X_MAX_R
+    X_MAX_R="${NEW_X_MAX:-NA}"
+
     local TAG="replot_${RUN_ID}_$$"
     local TS
     TS="$(date '+%Y%m%d_%H%M%S')"
@@ -867,19 +914,26 @@ run_replot_analysis() {
     mkdir -p "$ANALYSIS_OUT_DIR"
     local R_SCRIPT="$ANALYSIS_OUT_DIR/.run_${TAG}.R"
     local LOG_FILE="$ANALYSIS_OUT_DIR/${TAG}.log"
-    local OUT_VOL_PDF="$ANALYSIS_OUT_DIR/${SAFE_LABEL}_volcano_fdr${NEW_FDR}_lfc${NEW_FC}_${TS}.pdf"
-    local OUT_VOL_PNG="${OUT_VOL_PDF%.pdf}.png"
-    local OUT_MA_PDF="${OUT_VOL_PDF/_volcano_/_MA_}"
-    local OUT_MA_PNG="${OUT_MA_PDF%.pdf}.png"
-    local OUT_CSV="${OUT_VOL_PDF%_volcano_*}_replot_${TS}.csv"
+    # The mle/shrunken filename tag is NOT decided here in bash -- only R,
+    # after checking whether this bundle actually has MLE_log2FoldChange for
+    # this contrast, knows whether the requested estimate is available or
+    # falls back to shrunken. Building the tag here (as an earlier version
+    # of this feature did) meant a requested-but-unavailable MLE plot got
+    # saved with "_mle_" in the filename despite silently containing the
+    # shrunken data -- exactly the kind of mislabeling this whole feature
+    # exists to avoid. R constructs out_vol_pdf/out_vol_png/out_ma_pdf/
+    # out_ma_png itself below, after the fallback check, so the name on
+    # disk always matches what was actually plotted.
+    local OUT_CSV="$ANALYSIS_OUT_DIR/${SAFE_LABEL}_replot_${TS}.csv"
 
-    local RESOLVED_CONTRAST_R OUT_CSV_R OUT_VOL_PDF_R OUT_VOL_PNG_R OUT_MA_PDF_R OUT_MA_PNG_R
+    local RESOLVED_CONTRAST_R OUT_CSV_R OUT_DIR_R SAFE_LABEL_R TS_TAG_R FDR_TAG_R FC_TAG_R
     RESOLVED_CONTRAST_R="$(r_string_literal "$RESOLVED_CONTRAST")"
     OUT_CSV_R="$(r_string_literal "$OUT_CSV")"
-    OUT_VOL_PDF_R="$(r_string_literal "$OUT_VOL_PDF")"
-    OUT_VOL_PNG_R="$(r_string_literal "$OUT_VOL_PNG")"
-    OUT_MA_PDF_R="$(r_string_literal "$OUT_MA_PDF")"
-    OUT_MA_PNG_R="$(r_string_literal "$OUT_MA_PNG")"
+    OUT_DIR_R="$(r_string_literal "$ANALYSIS_OUT_DIR")"
+    SAFE_LABEL_R="$(r_string_literal "$SAFE_LABEL")"
+    TS_TAG_R="$(r_string_literal "$TS")"
+    FDR_TAG_R="$(r_string_literal "$NEW_FDR")"
+    FC_TAG_R="$(r_string_literal "$NEW_FC")"
 
     cat > "$R_SCRIPT" << RSCRIPT_EOF
 suppressPackageStartupMessages({
@@ -894,9 +948,51 @@ b           <- readRDS(${BUNDLE_PATH_R})
 label       <- ${RESOLVED_CONTRAST_R}
 fdr_cutoff  <- $NEW_FDR
 fc_cutoff   <- $NEW_FC
+y_max_override <- $Y_MAX_R   # NA = automatic; user-set value caps the volcano's Y axis
+x_max_override <- $X_MAX_R   # NA = automatic (symmetric to data); user-set value caps |log2FC|
 
 res <- b\$all_results[[label]]
 if (is.null(res)) stop("Contrast '", label, "' not found in bundle.")
+
+# Which effect-size estimate to plot/threshold on -- chosen interactively
+# above. DiffBind's own Fold column may be apeglm/ashr-shrunk; MLE_* columns
+# (if diff_analysis.sh successfully retrieved them for this contrast -- see
+# that script's per-contrast analysis loop) hold the actual unshrunken
+# DESeq2 coefficient the significance test evaluates. Substituting into
+# res\$log2FoldChange in place, rather than branching the rest of this
+# script, means every downstream step (thresholding, plotting, the CSV
+# export) automatically uses whichever estimate was chosen with no special-
+# casing needed past this point.
+use_mle_lfc <- $USE_MLE_LFC_R
+lfc_source_label <- "DiffBind shrunken Fold"
+if (use_mle_lfc) {
+    if ("MLE_log2FoldChange" %in% names(res)) {
+        res\$log2FoldChange <- res\$MLE_log2FoldChange
+        lfc_source_label <- "DESeq2 MLE (unshrunken)"
+        cat("Using unshrunken MLE log2FoldChange for this re-plot.\n")
+    } else {
+        cat("[WARN] MLE_log2FoldChange not found in this bundle (older diff_analysis.sh run,\n")
+        cat("       or extraction failed for this contrast) -- falling back to DiffBind's\n")
+        cat("       shrunken Fold.\n")
+        use_mle_lfc <- FALSE
+    }
+}
+
+# Filenames are built HERE, not in bash, specifically because use_mle_lfc
+# has just been finalized (post-fallback-check) -- building them in bash
+# before this point could only ever encode what was requested, not what
+# actually happened.
+lfc_tag <- if (use_mle_lfc) "mle" else "shrunken"
+out_dir    <- ${OUT_DIR_R}
+safe_label <- ${SAFE_LABEL_R}
+ts_tag     <- ${TS_TAG_R}
+fdr_tag    <- ${FDR_TAG_R}
+fc_tag     <- ${FC_TAG_R}
+out_vol_pdf <- file.path(out_dir, sprintf("%s_volcano_%s_fdr%s_lfc%s_%s.pdf",
+                                           safe_label, lfc_tag, fdr_tag, fc_tag, ts_tag))
+out_vol_png <- sub("\\\\.pdf$", ".png", out_vol_pdf)
+out_ma_pdf  <- sub("_volcano_", "_MA_", out_vol_pdf, fixed=TRUE)
+out_ma_png  <- sub("\\\\.pdf$", ".png", out_ma_pdf)
 
 # Re-apply thresholds.
 if (fc_cutoff > 0) {
@@ -921,10 +1017,23 @@ label_peaks <- res_plot[res_plot\$Sig, ]
 label_peaks\$peak_id <- paste0(label_peaks\$Chr, ":", label_peaks\$Start, "-", label_peaks\$End)
 
 subtitle_vol <- if (fc_cutoff > 0) {
-    sprintf("%d up, %d down  (FDR < %.4g  |  |log2FC| >= %.3g)",
-            n_up, n_down, fdr_cutoff, fc_cutoff)
+    sprintf("%d up, %d down  (FDR < %.4g  |  |log2FC| >= %.3g)  --  x-axis: %s",
+            n_up, n_down, fdr_cutoff, fc_cutoff, lfc_source_label)
 } else {
-    sprintf("%d up, %d down  (FDR < %.4g)", n_up, n_down, fdr_cutoff)
+    sprintf("%d up, %d down  (FDR < %.4g)  --  x-axis: %s", n_up, n_down, fdr_cutoff, lfc_source_label)
+}
+
+# Symmetric x-axis: cosmetic framing only, centered on 0 so the plot reads
+# left/right at a glance -- does not filter, alter, or hide any point, unless
+# the user explicitly asked for a smaller cap via x_max_override (in which
+# case points outside it are clipped, same as any manual axis limit).
+# Automatic case: max() over the actual plotted data means every point still
+# fits inside the frame; this only changes how far the frame extends past
+# zero on whichever side happens to have less spread.
+volcano_x_lim <- if (!is.na(x_max_override)) {
+    x_max_override
+} else {
+    max(abs(res_plot\$log2FoldChange), na.rm=TRUE)
 }
 
 p_vol <- ggplot(res_plot, aes(x=log2FoldChange, y=neg_log10_padj, color=Direction)) +
@@ -938,14 +1047,24 @@ p_vol <- ggplot(res_plot, aes(x=log2FoldChange, y=neg_log10_padj, color=Directio
                    color="grey50", linewidth=0.5)
       else list() } +
     scale_color_manual(values=c(Up="firebrick3", Down="steelblue3", NS="grey70")) +
+    # oob=scales::squish (instead of plain xlim()/ylim(), whose default
+    # oob=censor turns out-of-range points into NA and silently drops them):
+    # any point outside the frame gets clamped to sit right at the edge
+    # instead of vanishing, so a manual cap narrower than the data still
+    # shows where those points piled up. Inert in the automatic case (NA
+    # upper bound, or a limit computed from the data's own max) since
+    # nothing ever falls outside a limit derived from the data itself.
+    scale_x_continuous(limits=c(-volcano_x_lim, volcano_x_lim), oob=scales::squish) +
+    scale_y_continuous(limits=c(0, y_max_override), oob=scales::squish) +
     labs(title=paste0("Volcano: ", label),
          subtitle=subtitle_vol,
-         x="log2 Fold Change", y="-log10(adjusted p-value)") +
+         x=paste0("log2 Fold Change (", lfc_source_label, ")"),
+         y="-log10(adjusted p-value)") +
     theme_bw(base_size=13)
 
-ggsave(${OUT_VOL_PDF_R}, p_vol, width=8, height=6)
-ggsave(${OUT_VOL_PNG_R}, p_vol, width=8, height=6, dpi=150)
-cat("Volcano saved:", ${OUT_VOL_PDF_R}, "\n")
+ggsave(out_vol_pdf, p_vol, width=8, height=6)
+ggsave(out_vol_png, p_vol, width=8, height=6, dpi=150)
+cat("Volcano saved:", out_vol_pdf, "\n")
 
 # ── MA plot ───────────────────────────────────────────────────
 conc_col <- grep("^Conc", names(res), value=TRUE)[1]
@@ -962,11 +1081,11 @@ if (!is.na(conc_col)) {
         labs(title=paste0("MA: ", label),
              subtitle=subtitle_ma,
              x=paste0("Mean Accessibility (", conc_col, ", log2 concentration)"),
-             y="log2 Fold Change") +
+             y=paste0("log2 Fold Change (", lfc_source_label, ")")) +
         theme_bw(base_size=13)
-    ggsave(${OUT_MA_PDF_R}, p_ma, width=8, height=6)
-    ggsave(${OUT_MA_PNG_R}, p_ma, width=8, height=6, dpi=150)
-    cat("MA plot saved:", ${OUT_MA_PDF_R}, "\n")
+    ggsave(out_ma_pdf, p_ma, width=8, height=6)
+    ggsave(out_ma_png, p_ma, width=8, height=6, dpi=150)
+    cat("MA plot saved:", out_ma_pdf, "\n")
 } else {
     cat("  [NOTE] MA plot skipped: no 'Conc' column in results.\n")
 }
@@ -974,10 +1093,18 @@ RSCRIPT_EOF
 
     label "Running re-plot..."
     if run_r_script "$R_SCRIPT" "$LOG_FILE"; then
-        ok "Volcano PDF: $OUT_VOL_PDF"
-        ok "Volcano PNG: $OUT_VOL_PNG"
-        [[ -f "$OUT_MA_PDF" ]] && ok "MA PDF: $OUT_MA_PDF"
-        [[ -f "$OUT_MA_PNG" ]] && ok "MA PNG: $OUT_MA_PNG"
+        # Discovered by globbing the output dir, not assumed from a bash-side
+        # guess -- R decides the mle/shrunken tag at runtime (see above), so
+        # bash has no reliable way to know the exact filename in advance.
+        local found_vol_pdf found_vol_png found_ma_pdf found_ma_png
+        found_vol_pdf=$(find "$ANALYSIS_OUT_DIR" -maxdepth 1 -name "*_volcano_*.pdf" | head -1)
+        found_vol_png=$(find "$ANALYSIS_OUT_DIR" -maxdepth 1 -name "*_volcano_*.png" | head -1)
+        found_ma_pdf=$(find "$ANALYSIS_OUT_DIR" -maxdepth 1 -name "*_MA_*.pdf" | head -1)
+        found_ma_png=$(find "$ANALYSIS_OUT_DIR" -maxdepth 1 -name "*_MA_*.png" | head -1)
+        [[ -n "$found_vol_pdf" ]] && ok "Volcano PDF: $found_vol_pdf"
+        [[ -n "$found_vol_png" ]] && ok "Volcano PNG: $found_vol_png"
+        [[ -n "$found_ma_pdf" ]] && ok "MA PDF: $found_ma_pdf"
+        [[ -n "$found_ma_png" ]] && ok "MA PNG: $found_ma_png"
         ok "Results CSV: $OUT_CSV"
     else
         err "Re-plot failed. See log: $LOG_FILE"
@@ -2194,26 +2321,43 @@ run_tornado() {
     local SAFE_LABEL="${RESOLVED_CONTRAST//[^A-Za-z0-9_]/_}"
 
     # ── Centering ────────────────────────────────────────────────
+    # IMPORTANT: "Gene TSS"/"Gene TES" below are NOT the same operation as
+    # running deepTools --referencePoint TSS/TES directly on the peak BED.
+    # A differential-peak interval is not a gene: its BED start/end are just
+    # the two edges of that (typically sub-kb) peak, and this pipeline's own
+    # peak BEDs carry no strand ("." in column 6, so deepTools would treat
+    # every peak as "+"). Feeding peaks straight into TSS/TES mode produces
+    # two panels that are both just "distance from a peak edge" -- for a
+    # promoter mark like H3K4me3 those look nearly identical to each other,
+    # which is NOT the same thing as seeing true, strand-correct TSS/TES
+    # enrichment. Real gene anchoring requires real gene coordinates + real
+    # strand, which is why the two gene-anchored options below instead read
+    # the nearest-gene assignment (GeneChr/GeneStart/GeneEnd/GeneStrand)
+    # that diff_analysis.sh's ChIPseeker/TxDb step already wrote per
+    # significant peak into <contrast>_annotated_peaks.tsv, and build a
+    # proper stranded gene BED from that.
     blank
     echo -e "  ${BOLD}Center on:${RESET}"
-    echo -e "    ${CYAN}1${RESET}.  Peak centers"
-    echo -e "    ${CYAN}2${RESET}.  Region starts  ${DIM}(deepTools TSS mode)${RESET}"
-    echo -e "    ${CYAN}3${RESET}.  Region ends    ${DIM}(deepTools TES mode)${RESET}"
+    echo -e "    ${CYAN}1${RESET}.  Peak centers  ${DIM}(differential peak interval itself)${RESET}"
+    echo -e "    ${CYAN}2${RESET}.  Gene TSS      ${DIM}(nearest gene per peak; true strand-aware TSS)${RESET}"
+    echo -e "    ${CYAN}3${RESET}.  Gene TES      ${DIM}(nearest gene per peak; true strand-aware TES)${RESET}"
     blank
-    local T_CENTER T_CENTER_LABEL
+    local T_CENTER T_CENTER_LABEL T_GENE_ANCHOR
     while true; do
         read -p "  Choice [1/2/3, default 1]: " T_C
         T_C="${T_C:-1}"
         case "$T_C" in
             # deepTools accepts exactly TSS, TES, or center.  "midpoint" is
             # not a valid --referencePoint value.
-            1) T_CENTER="center"; T_CENTER_LABEL="peak center";  break ;;
-            2) T_CENTER="TSS";    T_CENTER_LABEL="region start"; break ;;
-            3) T_CENTER="TES";    T_CENTER_LABEL="region end";   break ;;
+            1) T_CENTER="center"; T_CENTER_LABEL="peak center"; T_GENE_ANCHOR=false; break ;;
+            2) T_CENTER="TSS";    T_CENTER_LABEL="TSS";         T_GENE_ANCHOR=true;  break ;;
+            3) T_CENTER="TES";    T_CENTER_LABEL="TES";         T_GENE_ANCHOR=true;  break ;;
             *) err "Enter 1, 2, or 3." ;;
         esac
     done
-    ok "Centering: $T_CENTER_LABEL"
+    ok "Centering: $T_CENTER_LABEL$($T_GENE_ANCHOR && echo " (gene-anchored)")"
+    local T_GENE_ANCHOR_R
+    T_GENE_ANCHOR_R=$($T_GENE_ANCHOR && echo "TRUE" || echo "FALSE")
 
     # ── Window size ──────────────────────────────────────────────
     blank
@@ -2254,6 +2398,39 @@ run_tornado() {
         esac
     done
     ok "Sort: $T_SORT_LABEL"
+
+    # ── Sort reference (which samples define the shared row order) ──
+    # Only meaningful for mean-based sorting (T_SORT_USING="mean") --
+    # peak_score/genomic/keep modes never consult sample values at all.
+    # deepTools sorts the matrix rows ONCE, producing one shared order
+    # displayed across every panel (verified against its actual source:
+    # one computeMatrix call + one plotHeatmap call means there is no way
+    # for panels to be sorted independently of each other here). Left at
+    # the default, that shared order is based on the mean across every
+    # sample combined. Restricting --sortUsingSamples to a reference group
+    # (e.g. WT replicates) instead orders every panel -- including the
+    # mutant/treatment ones -- by what the reference looked like, which is
+    # usually the more scientifically meaningful question for a two-
+    # condition comparison. Reuses prompt_sample_selection() (same
+    # numbers/names/group-name picker already used everywhere else in this
+    # script) rather than a bespoke menu.
+    local -a T_SORT_REF_SAMPLE_NAMES=()
+    if [[ "$T_SORT_MODE" == "mean" ]]; then
+        blank
+        echo -e "  ${BOLD}Sort genes by mean signal in:${RESET}"
+        echo -e "  ${DIM}Restricting this to a reference group (e.g. your WT replicates) orders${RESET}"
+        echo -e "  ${DIM}every panel's rows the same way -- by what the reference looked like --${RESET}"
+        echo -e "  ${DIM}instead of by all samples averaged together. Every panel still shows${RESET}"
+        echo -e "  ${DIM}every sample's own signal; only the shared row ORDER changes.${RESET}"
+        echo -e "  ${DIM}Type 'all' for the default (sort by all samples combined).${RESET}"
+        prompt_sample_selection "Reference sample(s)/group to sort by:" 1
+        if [[ "${#RESOLVED_SAMPLES[@]}" -lt "${#SAMPLE_NAMES[@]}" ]]; then
+            T_SORT_REF_SAMPLE_NAMES=("${RESOLVED_SAMPLES[@]}")
+            ok "Sorting by mean signal in: ${T_SORT_REF_SAMPLE_NAMES[*]}  (order applied to every panel)."
+        else
+            ok "Sorting by mean signal across all samples (default)."
+        fi
+    fi
 
     # ── Sample grouping ──────────────────────────────────────────
     blank
@@ -2384,9 +2561,114 @@ if (file.exists(native_up_bed) || file.exists(native_dn_bed)) {
 }
 
 # Determine BEDs to use.
+gene_anchor <- ${T_GENE_ANCHOR_R}
 beds  <- character(0)
 blabs <- character(0)
-if (subset == "all") {
+
+if (gene_anchor) {
+    # Gene-anchored TSS/TES: a differential peak is NOT a gene, and this
+    # pipeline's peak BEDs carry no strand ("." in column 6), so running
+    # deepTools --referencePoint TSS/TES directly on a peak BED just means
+    # "distance from a peak edge" -- not a real, strand-correct gene TSS/TES.
+    # Instead, build a proper gene BED from the nearest-gene assignment
+    # (GeneChr/GeneStart/GeneEnd/GeneStrand) that diff_analysis.sh's
+    # ChIPseeker/TxDb step already computed and wrote per significant peak.
+    ann_path <- file.path(c_dir, paste0(label, "_annotated_peaks.tsv"))
+    gene_bed_dir <- file.path(c_dir, "tornado")
+    dir.create(gene_bed_dir, showWarnings=FALSE, recursive=TRUE)
+
+    if (!file.exists(ann_path)) {
+        cat("ERROR: Gene-anchored tornado needs", basename(ann_path), "which was not found.\n")
+        cat("Re-run PEPATAC_diff_analysis.sh (ChIPseeker annotation step) for this contrast.\n")
+        quit(status=1)
+    }
+    ann <- tryCatch(
+        read.delim(ann_path, header=TRUE, stringsAsFactors=FALSE,
+                   quote="", comment.char="", check.names=FALSE),
+        error=function(e) NULL
+    )
+    if (is.null(ann) || nrow(ann) == 0) {
+        cat("ERROR: Could not read", ann_path, "or it is empty.\n")
+        quit(status=1)
+    }
+
+    # One row per unique gene: a gene can be the nearest gene to more than
+    # one significant peak, and a duplicate BED row would just repeat an
+    # identical TSS/TES profile in the heatmap. Keep, as each gene's
+    # representative row, whichever of its peaks has the strongest effect
+    # size, so "sort by BED score" still means something for this mode.
+    # Genes with no coordinate/strand ("*", ambiguous-locus genes) or no
+    # gene assigned at all are dropped -- they cannot be strand-anchored.
+    build_gene_bed <- function(ann_df, out_path) {
+        keep <- !is.na(ann_df\$GeneID) & nzchar(ann_df\$GeneID) &
+                !is.na(ann_df\$GeneChr) & !is.na(ann_df\$GeneStart) & !is.na(ann_df\$GeneEnd) &
+                !is.na(ann_df\$GeneStrand) & ann_df\$GeneStrand %in% c("+", "-")
+        ann_df <- ann_df[keep, , drop=FALSE]
+        if (nrow(ann_df) == 0) return(0L)
+
+        lfc_col <- grep("^log2FoldChange\$|^Fold\$", colnames(ann_df), value=TRUE, ignore.case=TRUE)[1]
+        gene_score <- if (!is.na(lfc_col)) abs(as.numeric(ann_df[[lfc_col]])) else rep(0, nrow(ann_df))
+        gene_score[!is.finite(gene_score)] <- 0
+
+        ord <- order(ann_df\$GeneID, -gene_score)
+        ann_df <- ann_df[ord, , drop=FALSE]
+        gene_score <- gene_score[ord]
+        first_idx <- !duplicated(ann_df\$GeneID)
+        genes <- ann_df[first_idx, , drop=FALSE]
+        genes\$.score <- gene_score[first_idx]
+
+        starts_0based <- pmax(0L, as.integer(genes\$GeneStart) - 1L)
+        write.table(
+            data.frame(genes\$GeneChr, starts_0based, as.integer(genes\$GeneEnd),
+                       genes\$GeneID, genes\$.score, genes\$GeneStrand),
+            out_path, sep="\t", quote=FALSE, row.names=FALSE, col.names=FALSE
+        )
+        nrow(genes)
+    }
+
+    dir_col <- grep("^Direction\$", colnames(ann), value=TRUE, ignore.case=TRUE)[1]
+    subset_ann <- function(want) {
+        if (is.na(dir_col)) return(ann[0, , drop=FALSE])
+        ann[!is.na(ann[[dir_col]]) & ann[[dir_col]] == want, , drop=FALSE]
+    }
+
+    all_gbed <- file.path(gene_bed_dir, paste0(label, "_genes_all.bed"))
+    up_gbed  <- file.path(gene_bed_dir, paste0(label, "_genes_up.bed"))
+    dn_gbed  <- file.path(gene_bed_dir, paste0(label, "_genes_down.bed"))
+
+    gene_counts <- integer(0)
+    if (subset == "all") {
+        n <- build_gene_bed(ann, all_gbed)
+        beds <- all_gbed; blabs <- "Genes_near_All_significant_peaks"; gene_counts <- n
+    } else if (subset == "up") {
+        n <- build_gene_bed(subset_ann("Up"), up_gbed)
+        beds <- up_gbed; blabs <- "Genes_near_Up_peaks"; gene_counts <- n
+    } else if (subset == "down") {
+        n <- build_gene_bed(subset_ann("Down"), dn_gbed)
+        beds <- dn_gbed; blabs <- "Genes_near_Down_peaks"; gene_counts <- n
+    } else if (subset == "split_dir") {
+        n_up <- build_gene_bed(subset_ann("Up"), up_gbed)
+        n_dn <- build_gene_bed(subset_ann("Down"), dn_gbed)
+        beds <- c(up_gbed, dn_gbed)
+        blabs <- c("Genes_near_Up_peaks", "Genes_near_Down_peaks")
+        gene_counts <- c(n_up, n_dn)
+    }
+
+    keep_idx <- gene_counts > 0
+    if (!any(keep_idx)) {
+        cat("ERROR: No significant peaks had a usable stranded gene assignment for this subset -- nothing to plot.\n")
+        quit(status=1)
+    }
+    if (any(!keep_idx)) {
+        cat("NOTE: skipping empty gene set(s):", paste(blabs[!keep_idx], collapse=", "), "\n")
+    }
+    beds        <- beds[keep_idx]
+    blabs       <- blabs[keep_idx]
+    gene_counts <- gene_counts[keep_idx]
+    for (gi in seq_along(beds)) {
+        cat(sprintf("  %s: %d unique gene(s) with usable coordinates/strand\n", blabs[gi], gene_counts[gi]))
+    }
+} else if (subset == "all") {
     beds  <- sig_bed
     blabs <- "All_significant_peaks"
 } else if (subset == "up") {
@@ -2475,7 +2757,7 @@ RSCRIPT_EOF
     fi
 
     # Verify BAMs exist and are indexed.
-    declare -a VALID_BAMS=() VALID_IDS=()
+    declare -a VALID_BAMS=() VALID_IDS=() VALID_GROUPS=()
     local i bam
     for i in "${!T_BAMS[@]}"; do
         bam="${T_BAMS[$i]}"
@@ -2493,6 +2775,7 @@ RSCRIPT_EOF
         fi
         VALID_BAMS+=("$bam")
         VALID_IDS+=("${T_SAMPLE_IDS[$i]}")
+        VALID_GROUPS+=("${T_GROUPS[$i]}")
     done
 
     if [[ ${#VALID_BAMS[@]} -eq 0 ]]; then
@@ -2504,7 +2787,7 @@ RSCRIPT_EOF
     # produced by PEPATAC during sample processing — these are ATAC-seq optimised
     # (Tn5 shift-corrected, read-count normalised) and live in the same aligned_*
     # folder as each BAM, named <SampleID>_smooth_shift.bw.
-    declare -a VALID_BIGWIGS=() SCORE_IDS=()
+    declare -a VALID_BIGWIGS=() SCORE_IDS=() SCORE_GROUPS=()
 
     blank
     label "Locating PEPATAC smoothShift bigWig tracks..."
@@ -2524,12 +2807,27 @@ RSCRIPT_EOF
 
         VALID_BIGWIGS+=("$bw")
         SCORE_IDS+=("${VALID_IDS[$i]}")
+        SCORE_GROUPS+=("${VALID_GROUPS[$i]}")
     done
 
     if [[ ${#VALID_BIGWIGS[@]} -eq 0 ]]; then
         err "No smoothShift bigWig tracks found — aborting tornado."
         return
     fi
+
+    # Short, human-readable figure labels -- "<Group> <n>" per replicate
+    # within its group (e.g. "WT 1", "WT 2", "D3a 1") instead of the full
+    # raw SampleID (e.g. "WT_B1_H3K4me3_S13_SRR11785444"), which collides
+    # badly across 6+ narrow deepTools panels. Full SampleIDs are still in
+    # SCORE_IDS/the log for traceability -- this is purely a figure-display
+    # label, built once here and reused wherever --samplesLabel is needed.
+    declare -a SCORE_SHORT_LABELS=()
+    declare -A GROUP_REP_COUNTER=()
+    for i in "${!SCORE_IDS[@]}"; do
+        local _grp="${SCORE_GROUPS[$i]:-sample}"
+        GROUP_REP_COUNTER["$_grp"]=$(( ${GROUP_REP_COUNTER["$_grp"]:-0} + 1 ))
+        SCORE_SHORT_LABELS+=("${_grp} ${GROUP_REP_COUNTER[$_grp]}")
+    done
 
     # ── Per-BED tornado generation ───────────────────────────────
     local bi
@@ -2575,7 +2873,7 @@ RSCRIPT_EOF
         local SORTED_BED="$TORNADO_OUT/${SAFE_LABEL}_${BED_LABEL}_sorted_regions_${TS}.bed"
 
         blank
-        label "Computing matrix: $BED_LABEL ($N_PEAKS peaks, ${#VALID_BIGWIGS[@]} bigWigs)..."
+        label "Computing matrix: $BED_LABEL ($N_PEAKS regions, ${#VALID_BIGWIGS[@]} bigWigs)..."
         echo -e "  ${DIM}Log: $LOG_FILE${RESET}"
 
         set +e
@@ -2606,7 +2904,7 @@ RSCRIPT_EOF
         local -a PLOT_COMMON=(
             --matrixFile "$MATRIX_OUT"
             --sortRegions "$T_SORT_REGIONS"
-            --samplesLabel "${SCORE_IDS[@]}"
+            --samplesLabel "${SCORE_SHORT_LABELS[@]}"
             --plotTitle "${RESOLVED_CONTRAST} — ${BED_LABEL//_/ }"
             --xAxisLabel "Distance from ${T_CENTER_LABEL}"
             --refPointLabel "$T_CENTER_LABEL"
@@ -2615,6 +2913,31 @@ RSCRIPT_EOF
         )
         if [[ -n "$T_SORT_USING" ]]; then
             PLOT_COMMON+=(--sortUsing "$T_SORT_USING")
+            # Restrict which samples' values determine the shared row order
+            # (chosen interactively above) -- indices are 1-based and must
+            # match the order samples were actually passed to computeMatrix
+            # (SCORE_IDS), not the original bundle-wide sample list, since
+            # some samples may have been dropped during BAM/bigWig
+            # validation above. Falls back to sorting by all samples
+            # (deepTools' own default when --sortUsingSamples is omitted)
+            # if none of the chosen reference sample(s) survived validation.
+            if [[ ${#T_SORT_REF_SAMPLE_NAMES[@]} -gt 0 ]]; then
+                local -a SORT_REF_INDICES=()
+                local _ref _j
+                for _ref in "${T_SORT_REF_SAMPLE_NAMES[@]}"; do
+                    for _j in "${!SCORE_IDS[@]}"; do
+                        if [[ "${SCORE_IDS[$_j]}" == "$_ref" ]]; then
+                            SORT_REF_INDICES+=("$((_j + 1))")
+                            break
+                        fi
+                    done
+                done
+                if [[ ${#SORT_REF_INDICES[@]} -gt 0 ]]; then
+                    PLOT_COMMON+=(--sortUsingSamples "${SORT_REF_INDICES[@]}")
+                else
+                    warn "None of the chosen reference sample(s) survived BAM/bigWig validation for '$BED_LABEL' -- sorting by all samples instead."
+                fi
+            fi
         fi
 
         label "Plotting tornado heatmap..."
@@ -2639,6 +2962,56 @@ RSCRIPT_EOF
             ok "Tornado PNG: $(basename "$HEATMAP_PNG")"
             [[ -s "$HEATMAP_PDF" ]] && ok "Tornado PDF: $(basename "$HEATMAP_PDF")"
             ok "Sorted regions BED: $(basename "$SORTED_BED")"
+
+            # ── Standalone profile (line-graph) plot, larger than the thin
+            # strip plotHeatmap draws above each heatmap column. --perGroup
+            # is used deliberately: this pipeline always hands computeMatrix
+            # exactly one region file per run (one BED per all/up/down
+            # subset), so deepTools' *default* profile layout -- one panel
+            # per sample, one line per region-group -- would degenerate into
+            # single-line panels here (verified against deepTools' own
+            # parserCommon.py: with only one region group, that layout has
+            # nothing to compare per panel). --perGroup instead draws one
+            # panel for that single region group with every sample as its
+            # own line -- the actual useful comparison. Also confirmed via
+            # deepTools' source that plotProfile does NOT accept
+            # --xAxisLabel (heatmap-only); --refPointLabel already labels
+            # the x=0 tick, so it is omitted here rather than guessed at.
+            local PROFILE_PNG="$TORNADO_OUT/${SAFE_LABEL}_${BED_LABEL}_profile_${TS}.png"
+            local PROFILE_PDF="$TORNADO_OUT/${SAFE_LABEL}_${BED_LABEL}_profile_${TS}.pdf"
+            local -a PROFILE_COMMON=(
+                --matrixFile "$MATRIX_OUT"
+                --perGroup
+                --samplesLabel "${SCORE_SHORT_LABELS[@]}"
+                --plotTitle "${RESOLVED_CONTRAST} — ${BED_LABEL//_/ }"
+                --refPointLabel "$T_CENTER_LABEL"
+                --plotHeight 12
+                --plotWidth 20
+            )
+
+            label "Plotting profile line graph..."
+            set +e
+            conda run --no-capture-output -n "$ENV_NAME" \
+                plotProfile \
+                    "${PROFILE_COMMON[@]}" \
+                    --outFileName "$PROFILE_PNG" \
+                    --dpi 200 \
+                >> "$LOG_FILE" 2>&1
+            local PROFILE_EXIT=$?
+            set -e
+
+            if [[ "$PROFILE_EXIT" -eq 0 ]]; then
+                conda run --no-capture-output -n "$ENV_NAME" \
+                    plotProfile \
+                        "${PROFILE_COMMON[@]}" \
+                        --outFileName "$PROFILE_PDF" \
+                    >> "$LOG_FILE" 2>&1 || true
+
+                ok "Profile line graph PNG: $(basename "$PROFILE_PNG")"
+                [[ -s "$PROFILE_PDF" ]] && ok "Profile line graph PDF: $(basename "$PROFILE_PDF")"
+            else
+                warn "plotProfile failed (tornado heatmap above is unaffected). Log: $LOG_FILE"
+            fi
         else
             err "plotHeatmap failed. Log: $LOG_FILE"
         fi
@@ -2647,6 +3020,8 @@ RSCRIPT_EOF
 
     unset T_BEDS T_BED_LABELS T_BAMS T_SAMPLE_IDS T_GROUPS
     unset VALID_BAMS VALID_IDS VALID_BIGWIGS SCORE_IDS
+    unset VALID_GROUPS SCORE_GROUPS SCORE_SHORT_LABELS
+    unset T_SORT_REF_SAMPLE_NAMES GROUP_REP_COUNTER
 }
 
 # ─────────────────────────────────────────────────────────────

@@ -2772,7 +2772,7 @@ write_tsv(
         MinOverlap=MIN_OVERLAP,
         Score_metric="DBA_SCORE_READS",
         Filter_threshold=DIFFBIND_FILTER,
-        Background_normalization_bins=DIFFBIND_BACKGROUND_VAL,
+        Background_normalization_bins=DIFFBIND_BACKGROUND,
         stringsAsFactors=FALSE
     ),
     file.path(diagnostics_dir, "diffbind_count_parameters.tsv")
@@ -3254,6 +3254,63 @@ for (ci in seq_along(CONTRAST_LABELS)) {
                            bBlacklist=FALSE, bGreylist=FALSE,
                            bParallel=DIFF_THREADS > 1)
 
+    # Also retrieve the UNSHRUNKEN MLE log2FoldChange, alongside DiffBind's
+    # own Fold (which dba.report() below may return apeglm/ashr-shrunk --
+    # see DiffBind's own docs). Verified on real data: plotting the shrunken
+    # Fold against this same contrast's Wald p-value can make the effect-
+    # size/significance relationship look far tighter than it really is,
+    # because shrinkage strength is itself a function of the same standard
+    # error that drives the p-value -- two related-but-distinct quantities
+    # that can visually read as one. The MLE estimate is the actual tested
+    # coefficient (stat = MLE_log2FC / lfcSE, exactly) and is the more
+    # conventional volcano-plot x-axis. Both are kept here, not one chosen
+    # for the user: MLE is noisier but direct/unregularized; shrunken Fold
+    # is more stable for ranking/visualization but can overstate how
+    # deterministic the effect-size/significance relationship looks. The
+    # explorer's re-plot menu lets users pick between them (see
+    # run_replot_analysis() in PEPATAC_explore...sh). Retrieved here, once,
+    # right after the real analysis -- re-running this from the explorer
+    # later would mean reloading the BAM-counting checkpoint from scratch.
+    # Non-fatal on failure: mle_cols stays NULL, the explorer just falls
+    # back to shrunken Fold automatically (see the merge below).
+    mle_cols <- NULL
+    tryCatch({
+        mle_dds <- dba.analyze(dba_sub, bRetrieveAnalysis=DBA_DESEQ2)
+        if (!is.null(mle_dds)) {
+            mle_res_df <- as.data.frame(
+                DESeq2::results(mle_dds, contrast=c("Condition", case_grp, ctrl_grp))
+            )
+            peaks_coords <- dba.peakset(dba_sub, bRetrieve=TRUE, DataType=DBA_DATA_FRAME)
+            # dba.peakset()'s Chr/Start/End capitalization varies by DiffBind
+            # version/context -- don't assume, look it up (same defensive
+            # pattern the explorer's peak-boxplot code already uses).
+            find_coord_col <- function(df, candidates) {
+                hit <- intersect(candidates, names(df))
+                if (length(hit) == 0) NA_character_ else hit[1]
+            }
+            pc_chr   <- find_coord_col(peaks_coords, c("Chr", "chr", "CHR", "seqnames"))
+            pc_start <- find_coord_col(peaks_coords, c("Start", "start", "START"))
+            pc_end   <- find_coord_col(peaks_coords, c("End", "end", "END"))
+            if (!is.na(pc_chr) && !is.na(pc_start) && !is.na(pc_end) &&
+                nrow(peaks_coords) == nrow(mle_res_df)) {
+                mle_cols <- data.frame(
+                    Chr = peaks_coords[[pc_chr]],
+                    Start = peaks_coords[[pc_start]],
+                    End = peaks_coords[[pc_end]],
+                    MLE_log2FoldChange = mle_res_df\$log2FoldChange,
+                    MLE_lfcSE = mle_res_df\$lfcSE,
+                    MLE_stat = mle_res_df\$stat,
+                    stringsAsFactors = FALSE
+                )
+                cat(sprintf("  Unshrunken MLE log2FC also retrieved for %s (%d peaks) -- available to the explorer as an alternate x-axis.\n",
+                            label, nrow(mle_cols)))
+            }
+        }
+    }, error = function(e) {
+        cat(sprintf("  [WARN] %s: could not retrieve unshrunken MLE log2FC (%s). Only the DiffBind Fold will be available for plotting.\n",
+                    label, conditionMessage(e)))
+    })
+
     # Save this contrast's actual normalization factors AFTER analyzing,
     # not before -- retrieving them post-dba.analyze() (rather than
     # immediately after the dba.normalize() call above) proves they
@@ -3290,8 +3347,18 @@ for (ci in seq_along(CONTRAST_LABELS)) {
     })
 
     # Extract results at the chosen FDR cutoff (th=1 pulls everything).
+    # precision=0: dba.report()'s default (precision=2:3 for DataType=
+    # DBA_DATA_FRAME) rounds Fold to 2 decimal places and signif()s p-value/
+    # FDR to 3 significant figures before returning them. FC_CUTOFF/FDR_CUTOFF
+    # below are compared directly against these values, so without
+    # precision=0 a peak genuinely near either threshold can be classified
+    # differently than the full-precision DESeq2 result would give -- e.g. a
+    # true log2FC of 0.5849 rounds to 0.58 and fails ">= 0.585" even though
+    # the real value was within 0.0001 of the cutoff. precision=0 stores full
+    # precision throughout (bundle, CSVs, plots), matching what's actually
+    # tested against the thresholds.
     res_dba <- dba.report(dba_sub, method=DBA_DESEQ2,
-                          th=1, bUsePval=FALSE,
+                          th=1, bUsePval=FALSE, precision=0,
                           DataType=DBA_DATA_FRAME)
 
     if (is.null(res_dba) || nrow(res_dba) == 0) {
@@ -3304,9 +3371,20 @@ for (ci in seq_along(CONTRAST_LABELS)) {
     # Direct name replacement is safer and avoids escape-sequence errors.
     nms <- names(res_dba)
     nms[nms == "Fold"] <- "log2FoldChange"
-    nms[nms %in% c("p.value", "pvalue")] <- "pvalue"
+    nms[nms %in% c("p.value", "pvalue", "p-value")] <- "pvalue"
     nms[nms == "FDR"] <- "padj"
     names(res_dba) <- nms
+
+    # Attach the unshrunken MLE columns retrieved above (if that succeeded)
+    # by genomic coordinate, not row position -- dba.report()'s own row
+    # order isn't guaranteed to match dba.peakset()'s. all.x=TRUE keeps
+    # every res_dba row even if a peak somehow didn't get an MLE match;
+    # sort=FALSE avoids merge()'s default re-sort-by-key (harmless either
+    # way since nothing downstream relies on row order, but keeps this
+    # merge from being a surprise if that ever changes).
+    if (!is.null(mle_cols)) {
+        res_dba <- merge(res_dba, mle_cols, by=c("Chr", "Start", "End"), all.x=TRUE, sort=FALSE)
+    }
 
     res_dba\$Contrast  <- label
     # Significance requires BOTH FDR and fold-change thresholds (set interactively).
