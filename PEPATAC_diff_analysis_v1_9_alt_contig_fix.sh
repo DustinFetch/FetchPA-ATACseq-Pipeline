@@ -27,7 +27,7 @@ set -euo pipefail
 #  11. Write explorer_bundle.rds for use with PEPATAC_explore.sh.
 # ============================================================
 
-DIFF_VERSION="1.9-alt-contig-fix"
+DIFF_VERSION="1.9-alt-contig-fix-mle-map-fix"
 SCRIPT_VERSION="$DIFF_VERSION"
 REFERENCE_SNAPSHOT_SCHEMA_SUPPORTED=4
 RUN_STARTED="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -3291,20 +3291,128 @@ for (ci in seq_along(CONTRAST_LABELS)) {
             pc_chr   <- find_coord_col(peaks_coords, c("Chr", "chr", "CHR", "seqnames"))
             pc_start <- find_coord_col(peaks_coords, c("Start", "start", "START"))
             pc_end   <- find_coord_col(peaks_coords, c("End", "end", "END"))
-            if (!is.na(pc_chr) && !is.na(pc_start) && !is.na(pc_end) &&
-                nrow(peaks_coords) == nrow(mle_res_df)) {
-                mle_cols <- data.frame(
-                    Chr = peaks_coords[[pc_chr]],
-                    Start = peaks_coords[[pc_start]],
-                    End = peaks_coords[[pc_end]],
-                    MLE_log2FoldChange = mle_res_df\$log2FoldChange,
-                    MLE_lfcSE = mle_res_df\$lfcSE,
-                    MLE_stat = mle_res_df\$stat,
-                    stringsAsFactors = FALSE
-                )
-                cat(sprintf("  Unshrunken MLE log2FC also retrieved for %s (%d peaks) -- available to the explorer as an alternate x-axis.\n",
-                            label, nrow(mle_cols)))
+            if (is.na(pc_chr) || is.na(pc_start) || is.na(pc_end)) {
+                cat(sprintf("  [WARN] %s: could not retrieve unshrunken MLE log2FC -- dba.peakset() coordinate columns not recognized (found: %s). Only the DiffBind Fold will be available for plotting.\n",
+                            label, paste(names(peaks_coords), collapse=", ")))
+            } else {
+                # DiffBind's design-based DESeq2 path (pv.DEinitDESeq2, used
+                # whenever dba.contrast() was called with design=/contrast=
+                # as this pipeline does) can drop peaks below its own
+                # internal count filter before ever building the
+                # DESeqDataSet -- separately from dba.count()'s own
+                # DIFFBIND_FILTER, and separately from dba.report()'s own
+                # per-contrast filtering below. When that happens, it does
+                # NOT renumber the surviving rows 1..N: it sets
+                # rownames(counts) <- which(keep), i.e. the ORIGINAL row
+                # index into the peakset that was passed in, preserved
+                # exactly (verified against DiffBind's actual current
+                # source, R/analyze_deseq2.R, and confirmed
+                # bRetrieveAnalysis=DBA_DESEQ2 returns that object with zero
+                # further modification -- DBA.R's return(DBA\$DESeq2\$DEdata)).
+                # So rather than assuming every consensus peak survived into
+                # the DESeq2 fit (the assumption that broke on the K4meTest
+                # dataset -- 54,461 peaks vs 54,437 DESeq2 rows), read those
+                # rownames back as indices into peaks_coords directly, and
+                # validate every part of that assumption explicitly rather
+                # than trusting it implicitly:
+                #   1. rownames(mle_res_df) must be IDENTICAL to
+                #      rownames(mle_dds) -- DESeq2::results() is documented
+                #      to preserve row order/names from its input, but this
+                #      whole fix exists to stop trusting implicit row-order
+                #      assumptions, so it is asserted here instead.
+                #   2. every rowname must match ^[1-9][0-9]*\$ literally
+                #      (a plain positive integer, no leading zero, no
+                #      whitespace/decimal) BEFORE it is ever passed to
+                #      as.integer() -- so a rowname format some other
+                #      DiffBind version uses can't be silently
+                #      misinterpreted as an index.
+                #   3. the resulting indices must be unique and in range.
+                # If a future DiffBind version changes this internal
+                # behavior, any one of these checks failing means this
+                # fails loudly (a [WARN], MLE simply unavailable) rather
+                # than silently mismatching peaks to the wrong MLE values.
+                mle_row_ids      <- rownames(mle_dds)
+                mle_res_row_ids  <- rownames(mle_res_df)
+                row_ids_match    <- identical(mle_res_row_ids, mle_row_ids)
+                row_id_format_ok <- length(mle_row_ids) > 0 &&
+                                    all(grepl("^[1-9][0-9]*\$", mle_row_ids))
+                mle_idx <- if (row_id_format_ok) suppressWarnings(as.integer(mle_row_ids)) else integer(0)
+
+                idx_valid <- row_ids_match &&
+                             row_id_format_ok &&
+                             length(mle_idx) == nrow(mle_res_df) &&
+                             length(mle_idx) > 0 &&
+                             !anyNA(mle_idx) &&
+                             !anyDuplicated(mle_idx) &&
+                             all(mle_idx >= 1 & mle_idx <= nrow(peaks_coords))
+
+                if (idx_valid) {
+                    mle_coords <- peaks_coords[mle_idx, , drop=FALSE]
+                    mle_cols <- data.frame(
+                        Chr = mle_coords[[pc_chr]],
+                        Start = mle_coords[[pc_start]],
+                        End = mle_coords[[pc_end]],
+                        MLE_log2FoldChange = mle_res_df\$log2FoldChange,
+                        MLE_lfcSE = mle_res_df\$lfcSE,
+                        MLE_stat = mle_res_df\$stat,
+                        stringsAsFactors = FALSE
+                    )
+
+                    # Coordinates must uniquely identify each mapped peak,
+                    # or the coordinate-based attachment further below
+                    # (match(), specifically chosen over merge() so a
+                    # duplicate key can never silently multiply rows) would
+                    # have an ambiguous target. Refuse rather than guess.
+                    mle_key <- paste(mle_cols\$Chr, mle_cols\$Start, mle_cols\$End, sep="\t")
+                    if (anyDuplicated(mle_key)) {
+                        cat(sprintf("  [WARN] %s: could not retrieve unshrunken MLE log2FC -- mapped MLE coordinates are not unique (%d duplicate coordinate key(s)); refusing ambiguous coordinate attachment. Only the DiffBind Fold will be available for plotting.\n",
+                                    label, sum(duplicated(mle_key))))
+                        mle_cols <- NULL
+                    } else {
+                        n_filtered <- nrow(peaks_coords) - nrow(mle_res_df)
+                        cat(sprintf("  Unshrunken MLE log2FC also retrieved for %s -- available to the explorer as an alternate x-axis.\n",
+                                    label))
+                        cat(sprintf("    Consensus peaks:               %d\n", nrow(peaks_coords)))
+                        cat(sprintf("    Peaks represented in DESeq2:   %d\n", nrow(mle_res_df)))
+                        cat(sprintf("    Filtered before DESeq2 model:  %d\n", n_filtered))
+                        cat(sprintf("    MLE coordinate mapping:        VERIFIED (rownames(mle_dds) used as original-peak indices, validated format/row-order/unique/in-range/complete)\n"))
+
+                        mle_diag_dir <- make_dir(file.path(DIFF_OUT, label, "diagnostics"))
+                        map_summary <- data.frame(
+                            Metric = c("Consensus_peaks", "Peaks_represented_in_DESeq2",
+                                       "Filtered_before_DESeq2_model", "Mapping_verified"),
+                            Value = c(nrow(peaks_coords), nrow(mle_res_df), n_filtered, "TRUE"),
+                            stringsAsFactors = FALSE
+                        )
+                        write_tsv(map_summary, file.path(mle_diag_dir, "diffbind_mle_mapping_summary.tsv"))
+
+                        if (n_filtered > 0) {
+                            omitted_idx <- setdiff(seq_len(nrow(peaks_coords)), mle_idx)
+                            omitted_df <- peaks_coords[omitted_idx, c(pc_chr, pc_start, pc_end), drop=FALSE]
+                            names(omitted_df) <- c("Chr", "Start", "End")
+                            write_tsv(omitted_df, file.path(mle_diag_dir, "mle_peaks_filtered_before_deseq2.tsv"))
+                            # Coordinates only -- this shows WHICH peaks were
+                            # dropped before the DESeq2 fit, not why (that
+                            # would require also saving the filter
+                            # score/threshold DiffBind's internal filterFun
+                            # actually applied).
+                            cat(sprintf("    Filtered peak coordinates saved (which peaks were dropped, not why): mle_peaks_filtered_before_deseq2.tsv\n"))
+                        }
+                    }
+                } else {
+                    cat(sprintf("  [WARN] %s: could not retrieve unshrunken MLE log2FC -- rownames(mle_dds) did not validate as usable original-peak indices (row order matches results()=%s, format all ^[1-9][0-9]*=%s, n=%d vs %d DESeq2 results, has NA=%s, has duplicates=%s, all in-range=%s). Only the DiffBind Fold will be available for plotting.\n",
+                                label, row_ids_match, row_id_format_ok, length(mle_idx), nrow(mle_res_df),
+                                if (length(mle_idx) > 0) anyNA(mle_idx) else NA,
+                                if (length(mle_idx) > 0) anyDuplicated(mle_idx) > 0 else NA,
+                                if (length(mle_idx) > 0) all(mle_idx >= 1 & mle_idx <= nrow(peaks_coords)) else NA))
+                }
             }
+        } else {
+            # dba.analyze(bRetrieveAnalysis=DBA_DESEQ2) returning NULL is not
+            # an R error, so the tryCatch below never fires for this case --
+            # log it explicitly rather than leave it silent.
+            cat(sprintf("  [WARN] %s: could not retrieve unshrunken MLE log2FC -- dba.analyze(bRetrieveAnalysis=DBA_DESEQ2) returned NULL (no error thrown). Only the DiffBind Fold will be available for plotting.\n",
+                        label))
         }
     }, error = function(e) {
         cat(sprintf("  [WARN] %s: could not retrieve unshrunken MLE log2FC (%s). Only the DiffBind Fold will be available for plotting.\n",
@@ -3376,19 +3484,43 @@ for (ci in seq_along(CONTRAST_LABELS)) {
     names(res_dba) <- nms
 
     # Attach the unshrunken MLE columns retrieved above (if that succeeded)
-    # by genomic coordinate, not row position -- dba.report()'s own row
-    # order isn't guaranteed to match dba.peakset()'s. all.x=TRUE keeps
-    # every res_dba row even if a peak somehow didn't get an MLE match;
-    # sort=FALSE avoids merge()'s default re-sort-by-key (harmless either
-    # way since nothing downstream relies on row order, but keeps this
-    # merge from being a surprise if that ever changes).
+    # by genomic coordinate. match() is used instead of merge() specifically
+    # so a duplicate coordinate key can never silently multiply res_dba's
+    # rows -- the MLE mapping block above already refuses to build mle_cols
+    # with duplicate keys, but this re-checks independently rather than
+    # relying on that guarantee holding across an edit to either block.
+    # match() also guarantees res_dba's own row order/count is unchanged,
+    # which merge() does not strictly guarantee; asserted explicitly below
+    # rather than assumed.
     if (!is.null(mle_cols)) {
-        res_dba <- merge(res_dba, mle_cols, by=c("Chr", "Start", "End"), all.x=TRUE, sort=FALSE)
+        res_key <- paste(res_dba\$Chr, res_dba\$Start, res_dba\$End, sep="\t")
+        mle_key <- paste(mle_cols\$Chr, mle_cols\$Start, mle_cols\$End, sep="\t")
+        if (anyDuplicated(mle_key)) {
+            cat(sprintf("  [WARN] %s: MLE coordinate keys are not unique at attachment time -- skipping MLE attachment to the report.\n", label))
+        } else {
+            n_before_mle_attach <- nrow(res_dba)
+            mle_match <- match(res_key, mle_key)
+            res_dba\$MLE_log2FoldChange <- mle_cols\$MLE_log2FoldChange[mle_match]
+            res_dba\$MLE_lfcSE          <- mle_cols\$MLE_lfcSE[mle_match]
+            res_dba\$MLE_stat           <- mle_cols\$MLE_stat[mle_match]
+            stopifnot(nrow(res_dba) == n_before_mle_attach)
+            n_mle_matched <- sum(!is.na(mle_match))
+            cat(sprintf("  MLE columns attached to DiffBind report: %d/%d rows matched by coordinate.\n",
+                        n_mle_matched, nrow(res_dba)))
+            if (n_mle_matched != nrow(res_dba)) {
+                cat(sprintf("  [WARN] %s: %d DiffBind report rows had no MLE coordinate match; those MLE fields are NA.\n",
+                            label, nrow(res_dba) - n_mle_matched))
+            }
+        }
     }
 
     res_dba\$Contrast  <- label
     # Significance requires BOTH FDR and fold-change thresholds (set interactively).
     # FC_CUTOFF == 0 means FDR-only filtering.
+    # NOTE: log2FoldChange here is DiffBind's own (possibly shrunken) Fold
+    # column, NOT MLE_log2FoldChange attached above -- the MLE columns are
+    # an alternate plotting/diagnostic quantity only and do not change
+    # which peaks this pipeline calls significant.
     if (FC_CUTOFF > 0) {
         res_dba\$Sig <- !is.na(res_dba\$padj) &
                        res_dba\$padj < FDR_CUTOFF &
