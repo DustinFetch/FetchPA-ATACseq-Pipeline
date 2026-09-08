@@ -3265,7 +3265,22 @@ def main():
         chrom, start, end, name, score, strand = meta[row_idx]
         start, end = int(start), int(end)
         ref = ref_point(args.center_mode, start, end, strand)
-        wstart, wend = ref - upstream + bin_idx * bin_size, ref - upstream + (bin_idx + 1) * bin_size
+
+        # deepTools reverses the computed coverage vector for every
+        # negative-strand BED row so that matrix columns remain oriented
+        # from transcriptional upstream to downstream. Mirror that reversal
+        # when mapping a matrix bin back to genomic coordinates for this
+        # independent check. Without this branch, TSS/TES validation compares
+        # negative-strand matrix bins with bins from the opposite side of the
+        # reference point and falsely reports otherwise valid matrices as
+        # mismatches. Peak-centered rows normally have strand "." and follow
+        # the forward/genomic-order branch.
+        if strand == "-":
+            wstart = ref + upstream - (bin_idx + 1) * bin_size
+            wend = ref + upstream - bin_idx * bin_size
+        else:
+            wstart = ref - upstream + bin_idx * bin_size
+            wend = ref - upstream + (bin_idx + 1) * bin_size
         bw = get_bw(sample_idx)
         chrom_len = bw.chroms().get(chrom)
         if chrom_len is None or wstart < 0 or wend > chrom_len:
