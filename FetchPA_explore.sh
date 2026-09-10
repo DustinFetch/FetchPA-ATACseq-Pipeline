@@ -3376,6 +3376,12 @@ def main():
     ap.add_argument("--ref-label", default="center")
     ap.add_argument("--units-note", default="",
                      help="appended to the y-axis label and TSV header comment, e.g. ' (smoothShift signal x 1000000)'")
+    ap.add_argument("--profile-y-min", type=float, default=None,
+                     help="shared lower y-axis limit for composite profile plots")
+    ap.add_argument("--profile-y-max", type=float, default=None,
+                     help="shared upper y-axis limit for composite profile plots")
+    ap.add_argument("--defer-profile-plot", action="store_true",
+                     help="write the composite matrix/profile TSV now and render the profile later")
     args = ap.parse_args()
 
     groups = []
@@ -3441,6 +3447,14 @@ def main():
                 fh.write(f"{g['label']}\t{bin_centers[b]:.1f}\t{mean[b]:.6g}\t{sd[b]:.6g}\t{reps.shape[0]}\n")
 
     # ── Shaded composite trace plot ──
+    # Composite mode is intentionally two-pass.  The first pass writes all
+    # matrices/TSVs for the contrast; after their shared limits are known,
+    # the caller invokes this script again to render every profile with the
+    # same y axis.  This prevents Matplotlib from independently autoscaling
+    # WT, treatment, Up, and Down figures.
+    if args.defer_profile_plot:
+        return
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -3460,6 +3474,12 @@ def main():
     ax.set_xlabel(f"Distance from {args.ref_label} (bp)")
     ax.set_ylabel(f"Mean signal{args.units_note}")
     ax.set_title(args.title)
+    if args.profile_y_min is not None or args.profile_y_max is not None:
+        current_min, current_max = ax.get_ylim()
+        ax.set_ylim(
+            args.profile_y_min if args.profile_y_min is not None else current_min,
+            args.profile_y_max if args.profile_y_max is not None else current_max,
+        )
     ax.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(args.profile_plot_png, dpi=200)
@@ -3468,6 +3488,85 @@ def main():
 if __name__ == "__main__":
     main()
 PYEOF
+    fi
+
+    # Composite figures are rendered in a second pass so every figure from
+    # this contrast uses identical quantitative limits.  The heatmap upper
+    # limit is the largest panel-specific 98th percentile (a robust display
+    # convention that limits domination by isolated extreme bins), while profile limits include the
+    # complete mean +/- SD envelope.  Using one contrast-wide limit prevents
+    # apparent differences caused only by independent autoscaling.
+    local COMPOSITE_SCALE_PY=""
+    if [[ "$T_DISPLAY_MODE" == "composite" ]]; then
+        COMPOSITE_SCALE_PY="$TORNADO_COMPUTE_DIR/.${TAG}_shared_scale.py"
+        cat > "$COMPOSITE_SCALE_PY" << 'SCALEPYEOF'
+#!/usr/bin/env python3
+import argparse, csv, gzip, json, math, sys
+import numpy as np
+
+def matrix_values(path):
+    rows = []
+    with gzip.open(path, "rt") as fh:
+        first = fh.readline()
+        if not first.startswith("@"):
+            raise ValueError(f"{path} is not a deepTools matrix")
+        for line in fh:
+            if not line.strip():
+                continue
+            fields = line.rstrip("\n").split("\t", 6)
+            if len(fields) == 7:
+                rows.append(np.fromstring(fields[6], sep="\t", dtype=float))
+    return np.concatenate(rows) if rows else np.empty(0, dtype=float)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", required=True,
+                    help="TSV with composite-matrix and profile-TSV paths")
+    args = ap.parse_args()
+
+    panel_p98 = []
+    panel_max = []
+    profile_upper = []
+    with open(args.manifest) as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            matrix_path, profile_path = line.rstrip("\n").split("\t", 1)
+            vals = matrix_values(matrix_path)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                panel_p98.append(float(np.percentile(vals, 98)))
+                panel_max.append(float(np.max(vals)))
+
+            with open(profile_path, newline="") as pfh:
+                reader = csv.reader(pfh, delimiter="\t")
+                next(reader, None)
+                for row in reader:
+                    if len(row) < 4:
+                        continue
+                    mean, sd = float(row[2]), float(row[3])
+                    if math.isfinite(mean) and math.isfinite(sd):
+                        profile_upper.append(mean + sd)
+
+    if not panel_max or not profile_upper:
+        sys.exit("ERROR: no finite composite values were available for shared-axis calculation")
+
+    zmax = max(panel_p98) if panel_p98 else 0.0
+    if not math.isfinite(zmax) or zmax <= 0:
+        zmax = max(panel_max)
+    ymax = max(profile_upper)
+    if not math.isfinite(ymax) or ymax <= 0:
+        ymax = max(panel_max)
+    if not math.isfinite(zmax) or zmax <= 0 or not math.isfinite(ymax) or ymax <= 0:
+        sys.exit("ERROR: shared composite limits are not positive finite numbers")
+
+    # Five percent headroom keeps the tallest SD ribbon off the frame.
+    ymax *= 1.05
+    print(f"{zmax:.17g}\t{ymax:.17g}")
+
+if __name__ == "__main__":
+    main()
+SCALEPYEOF
     fi
 
     # One groups-file per RUN (not one global file) -- each run only feeds
@@ -3489,6 +3588,16 @@ PYEOF
             done
             T_RUN_GROUPS_TSV+=("$_run_tsv")
         done
+    fi
+
+    # Successful first-pass composite outputs are collected here and
+    # rendered together only after one shared scale has been calculated.
+    local COMPOSITE_MANIFEST="$TORNADO_COMPUTE_DIR/.${TAG}_composite_scale_manifest.tsv"
+    declare -a C_SOURCE_MATRIX=() C_MATRIX=() C_GROUP_TSV=() C_PROFILE_TSV=()
+    declare -a C_PROFILE_PNG=() C_PROFILE_PDF=() C_TITLE=()
+    declare -a C_HEATMAP_PNG=() C_HEATMAP_PDF=() C_SORTED_BED=()
+    if [[ "$T_DISPLAY_MODE" == "composite" ]]; then
+        : > "$COMPOSITE_MANIFEST"
     fi
 
     # ── Per-BED tornado generation ───────────────────────────────
@@ -3651,6 +3760,7 @@ PYEOF
                     --title "$COMPOSITE_TITLE" \
                     --ref-label "$T_CENTER_LABEL" \
                     --units-note "$TORNADO_UNITS_NOTE" \
+                    --defer-profile-plot \
                     >> "$LOG_FILE" 2>&1
                 local COMPOSITE_EXIT=$?
                 set -e
@@ -3661,52 +3771,17 @@ PYEOF
                 fi
                 ok "Composite matrix written: $(basename "$COMPOSITE_MATRIX_OUT")"
                 ok "Composite profile data: $(basename "$COMPOSITE_PROFILE_TSV")"
-                ok "Composite trace (mean +/- SD) PNG: $(basename "$COMPOSITE_PROFILE_PNG")"
-                [[ -s "$COMPOSITE_PROFILE_PDF" ]] && ok "Composite trace (mean +/- SD) PDF: $(basename "$COMPOSITE_PROFILE_PDF")"
-
-                local -a PLOT_COMPOSITE=(
-                    --matrixFile "$COMPOSITE_MATRIX_OUT"
-                    --sortRegions "$T_SORT_REGIONS"
-                    --samplesLabel "${_run_labels[@]}"
-                    --plotTitle "$COMPOSITE_TITLE"
-                    --xAxisLabel "Distance from ${T_CENTER_LABEL}"
-                    --refPointLabel "$T_CENTER_LABEL"
-                    --heatmapHeight 15
-                    --heatmapWidth 3
-                    --colorList "$TORNADO_HEATMAP_COLORLIST"
-                )
-                if [[ -n "$T_SORT_USING" ]]; then
-                    PLOT_COMPOSITE+=(--sortUsing "$T_SORT_USING")
-                    if [[ -n "$T_SORT_REF_GROUP_INDEX" ]]; then
-                        PLOT_COMPOSITE+=(--sortUsingSamples "$T_SORT_REF_GROUP_INDEX")
-                    fi
-                fi
-
-                label "Plotting composite tornado heatmap: ${_group_join}..."
-                set +e
-                conda run --no-capture-output -n "$ENV_NAME" \
-                    plotHeatmap \
-                        "${PLOT_COMPOSITE[@]}" \
-                        --outFileName "$COMPOSITE_HEATMAP_PNG" \
-                        --outFileSortedRegions "$COMPOSITE_SORTED_BED" \
-                        --dpi 200 \
-                    >> "$LOG_FILE" 2>&1
-                local COMPOSITE_HEATMAP_EXIT=$?
-                set -e
-
-                if [[ "$COMPOSITE_HEATMAP_EXIT" -eq 0 ]]; then
-                    conda run --no-capture-output -n "$ENV_NAME" \
-                        plotHeatmap \
-                            "${PLOT_COMPOSITE[@]}" \
-                            --outFileName "$COMPOSITE_HEATMAP_PDF" \
-                        >> "$LOG_FILE" 2>&1 || true
-
-                    ok "Composite tornado PNG: $(basename "$COMPOSITE_HEATMAP_PNG")"
-                    [[ -s "$COMPOSITE_HEATMAP_PDF" ]] && ok "Composite tornado PDF: $(basename "$COMPOSITE_HEATMAP_PDF")"
-                    ok "Sorted regions BED: $(basename "$COMPOSITE_SORTED_BED")"
-                else
-                    err "plotHeatmap failed for composite matrix '${T_RUN_LABELS[$_ri]}'. Log: $LOG_FILE"
-                fi
+                C_SOURCE_MATRIX+=("$MATRIX_OUT")
+                C_MATRIX+=("$COMPOSITE_MATRIX_OUT")
+                C_GROUP_TSV+=("${T_RUN_GROUPS_TSV[$_ri]}")
+                C_PROFILE_TSV+=("$COMPOSITE_PROFILE_TSV")
+                C_PROFILE_PNG+=("$COMPOSITE_PROFILE_PNG")
+                C_PROFILE_PDF+=("$COMPOSITE_PROFILE_PDF")
+                C_TITLE+=("$COMPOSITE_TITLE")
+                C_HEATMAP_PNG+=("$COMPOSITE_HEATMAP_PNG")
+                C_HEATMAP_PDF+=("$COMPOSITE_HEATMAP_PDF")
+                C_SORTED_BED+=("$COMPOSITE_SORTED_BED")
+                printf '%s\t%s\n' "$COMPOSITE_MATRIX_OUT" "$COMPOSITE_PROFILE_TSV" >> "$COMPOSITE_MANIFEST"
             done
 
             continue
@@ -3833,12 +3908,124 @@ PYEOF
 
     done
 
+    # ── Composite second pass: one axis/color scale per contrast ──
+    if [[ "$T_DISPLAY_MODE" == "composite" ]]; then
+        if [[ "${#C_MATRIX[@]}" -eq 0 ]]; then
+            err "No composite matrices were generated successfully -- nothing to plot."
+        else
+            label "Calculating one shared signal scale across ${#C_MATRIX[@]} composite figure set(s)..."
+            local SHARED_LIMITS SHARED_ZMAX SHARED_YMAX
+            set +e
+            SHARED_LIMITS=$(conda run --no-capture-output -n "$ENV_NAME" python3 "$COMPOSITE_SCALE_PY" \
+                --manifest "$COMPOSITE_MANIFEST" 2>> "$LOG_FILE")
+            local SCALE_EXIT=$?
+            set -e
+
+            if [[ "$SCALE_EXIT" -ne 0 ]]; then
+                err "Could not calculate shared composite axes. No composite figures were rendered."
+                err "See log: $LOG_FILE"
+            else
+                IFS=$'\t' read -r SHARED_ZMAX SHARED_YMAX <<< "$SHARED_LIMITS"
+                ok "Shared composite profile y-axis: 0 to ${SHARED_YMAX}"
+                ok "Shared composite heatmap color scale: 0 to ${SHARED_ZMAX}"
+                {
+                    echo "[composite-shared-scale] figure sets: ${#C_MATRIX[@]}"
+                    echo "[composite-shared-scale] profile y limits: 0 ${SHARED_YMAX}"
+                    echo "[composite-shared-scale] heatmap z limits: 0 ${SHARED_ZMAX}"
+                    echo "[composite-shared-scale] heatmap upper limit = maximum panel-specific 98th percentile"
+                } >> "$LOG_FILE"
+
+                local ci
+                for ci in "${!C_MATRIX[@]}"; do
+                    local -a _shared_labels=()
+                    local _shared_label _shared_indices
+                    while IFS=$'\t' read -r _shared_label _shared_indices; do
+                        [[ -n "$_shared_label" ]] && _shared_labels+=("$_shared_label")
+                    done < "${C_GROUP_TSV[$ci]}"
+
+                    label "Rendering shared-scale composite figures: ${C_TITLE[$ci]}..."
+                    set +e
+                    conda run --no-capture-output -n "$ENV_NAME" python3 "$COMPOSITE_PY" \
+                        --matrix "${C_SOURCE_MATRIX[$ci]}" \
+                        --groups-file "${C_GROUP_TSV[$ci]}" \
+                        --composite-matrix-out "${C_MATRIX[$ci]}" \
+                        --profile-tsv-out "${C_PROFILE_TSV[$ci]}" \
+                        --profile-plot-png "${C_PROFILE_PNG[$ci]}" \
+                        --profile-plot-pdf "${C_PROFILE_PDF[$ci]}" \
+                        --title "${C_TITLE[$ci]}" \
+                        --ref-label "$T_CENTER_LABEL" \
+                        --units-note "$TORNADO_UNITS_NOTE" \
+                        --profile-y-min 0 \
+                        --profile-y-max "$SHARED_YMAX" \
+                        >> "$LOG_FILE" 2>&1
+                    local PROFILE_SHARED_EXIT=$?
+                    set -e
+
+                    if [[ "$PROFILE_SHARED_EXIT" -eq 0 ]]; then
+                        ok "Composite trace (shared y-axis) PNG: $(basename "${C_PROFILE_PNG[$ci]}")"
+                        [[ -s "${C_PROFILE_PDF[$ci]}" ]] && ok "Composite trace (shared y-axis) PDF: $(basename "${C_PROFILE_PDF[$ci]}")"
+                    else
+                        err "Shared-axis composite profile failed. Log: $LOG_FILE"
+                    fi
+
+                    local -a PLOT_COMPOSITE=(
+                        --matrixFile "${C_MATRIX[$ci]}"
+                        --sortRegions "$T_SORT_REGIONS"
+                        --samplesLabel "${_shared_labels[@]}"
+                        --plotTitle "${C_TITLE[$ci]}"
+                        --xAxisLabel "Distance from ${T_CENTER_LABEL}"
+                        --refPointLabel "$T_CENTER_LABEL"
+                        --heatmapHeight 15
+                        --heatmapWidth 3
+                        --colorList "$TORNADO_HEATMAP_COLORLIST"
+                        --zMin 0
+                        --zMax "$SHARED_ZMAX"
+                        # plotHeatmap's embedded summary trace has its own
+                        # y-axis controls; these must match the standalone
+                        # composite profile limits calculated above.
+                        --yMin 0
+                        --yMax "$SHARED_YMAX"
+                    )
+                    if [[ -n "$T_SORT_USING" ]]; then
+                        PLOT_COMPOSITE+=(--sortUsing "$T_SORT_USING")
+                        if [[ -n "$T_SORT_REF_GROUP_INDEX" ]]; then
+                            PLOT_COMPOSITE+=(--sortUsingSamples "$T_SORT_REF_GROUP_INDEX")
+                        fi
+                    fi
+
+                    set +e
+                    conda run --no-capture-output -n "$ENV_NAME" plotHeatmap \
+                        "${PLOT_COMPOSITE[@]}" \
+                        --outFileName "${C_HEATMAP_PNG[$ci]}" \
+                        --outFileSortedRegions "${C_SORTED_BED[$ci]}" \
+                        --dpi 200 >> "$LOG_FILE" 2>&1
+                    local HEATMAP_SHARED_EXIT=$?
+                    set -e
+
+                    if [[ "$HEATMAP_SHARED_EXIT" -eq 0 ]]; then
+                        conda run --no-capture-output -n "$ENV_NAME" plotHeatmap \
+                            "${PLOT_COMPOSITE[@]}" \
+                            --outFileName "${C_HEATMAP_PDF[$ci]}" \
+                            >> "$LOG_FILE" 2>&1 || true
+                        ok "Composite tornado (shared color scale) PNG: $(basename "${C_HEATMAP_PNG[$ci]}")"
+                        [[ -s "${C_HEATMAP_PDF[$ci]}" ]] && ok "Composite tornado (shared color scale) PDF: $(basename "${C_HEATMAP_PDF[$ci]}")"
+                        ok "Sorted regions BED: $(basename "${C_SORTED_BED[$ci]}")"
+                    else
+                        err "Shared-scale composite heatmap failed. Log: $LOG_FILE"
+                    fi
+                done
+            fi
+        fi
+    fi
+
     unset T_BEDS T_BED_LABELS T_BAMS T_SAMPLE_IDS T_GROUPS
     unset VALID_BAMS VALID_IDS VALID_BIGWIGS SCORE_IDS
     unset VALID_GROUPS SCORE_GROUPS SCORE_SHORT_LABELS
     unset T_SORT_REF_SAMPLE_NAMES GROUP_REP_COUNTER
     unset T_COMPOSITE_GROUP_NAMES T_COMPOSITE_GROUP_MEMBERS
     unset T_COMPOSITE_GROUP_INDICES T_COMPOSITE_GROUP_LABELS
+    unset C_SOURCE_MATRIX C_MATRIX C_GROUP_TSV C_PROFILE_TSV C_PROFILE_PNG C_PROFILE_PDF C_TITLE
+    unset C_HEATMAP_PNG C_HEATMAP_PDF C_SORTED_BED
 }
 
 run_tornado_individual() { run_tornado "individual"; }
