@@ -19,7 +19,14 @@ Each script is interactive: it collects all user settings upfront, and once conf
 
 ![FetchPA workflow diagram](images/workflow_diagram.png)
 
-*Configuration and settings feed into read processing, alignment, peak calling, and differential analysis, which in turn feeds the exploratory analysis stage — matching the install → run → diff analysis → explore pipeline below.*
+*Workflow of FetchPA. FetchPA inputs include either local .fastq files or data from public 
+repositories available via SRA/PRJNA accession numbers Input and settings are configured and saved in a “run 
+manifest” and “sample manifest” files. .fastq files are processed with several consecutive QC checks, trimming, 
+alignment and visualization via PEPATAC workflow. Regions list (.narrowPeak) output is analyzed via DESeq2 
+and subsequent exploratory analyses. Blue boxes indicate critical steps, green boxes denote significant outputs, and 
+orange boxes show outputs that may be used in subsequent expert analyses (see Figure 2 for specific examples). 
+Red dots indicate select “resume points” where analyses can be restarted without re-doing previously completed 
+steps.*
 
 ---
 
@@ -203,7 +210,14 @@ Because the differential results and VST matrix are already stored, most plots a
 
 ![Example FetchPA explorer output](images/example_output_figure.png)
 
-*(Replace this caption with the panel-by-panel description of your final FetchPA example figure.)*
+*Representative outputs of FetchPA. a, fragment size distribution plot from a single ATAC-Seq library; 
+b, .bigwig visualization of individual replicates; c, principal component analyses plot for all samples in the dataset
+d, volcano plot for visualization of differentially accessible regions under user-defined parameters and contrasts, e, 
+distribution of differentially accessible regions relative to genome features, f, tornado plots of signal at differentially 
+accessible regionsб, showing median signal of three replicates per condition; g, motifs enriched at differentially 
+accessible regions. All examples shown here represent direct output of FetchPA minimally adjusted in Adobe 
+Illustrator, using ATAC-Seq data from (Yusufova et al., 2021), downloaded from Gene Expression Omnibus 
+GSE143293. *
 
 ---
 
