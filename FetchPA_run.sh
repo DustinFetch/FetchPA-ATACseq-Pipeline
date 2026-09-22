@@ -13,6 +13,31 @@ set -euo pipefail
 #   4. Run preflight checks.
 #   5. Take off and process samples (skipping any that already
 #      PASSED in a previous run).
+#
+# Genome reference requirements (all five built-in genomes):
+#   The mitochondrial contig MUST be named exactly "chrM". This isn't a
+#   preference of this script -- it's what PEPATAC itself requires: its
+#   mitochondrial-read removal greps `samtools idxstats` output for one of
+#   a fixed set of names (chrM/ChrM/ChrMT/chrMT/M/MT/rCRSd), and the
+#   standard Boyle-Lab/ENCODE blacklists are UCSC-named ("chr2L", "chrM",
+#   ...). A reference named any other way (e.g. RefSeq accessions such as
+#   dm6's Refgenie asset in this install, chrM = NC_024511.2) doesn't error
+#   -- it just silently reports zero mitochondrial reads and shares no
+#   blacklist names, so nothing gets filtered. validate_mito_naming_
+#   compatibility() (preflight) stops the run before any alignment work if
+#   the resolved reference doesn't satisfy this. dm6 is built locally from
+#   UCSC by default (GENOME_ON_REFGENIE["dm6"]="no") specifically so it
+#   always satisfies it; see smoke_test/test_dm6_reference.sh and
+#   smoke_test/synthetic_integration/ for the tests that prove this against
+#   a real, unmodified PEPATAC run.
+#
+#   Any dm6 run completed BEFORE this fix used the RefSeq-accession-named
+#   reference and therefore removed zero mitochondrial reads regardless of
+#   the blacklist result. It does not need to be manually invalidated --
+#   this runner's own resume-signature check (sample_signature(), compared
+#   against each sample's recorded PASS) already detects that the genome
+#   asset changed and forces a full reprocess (-N) the next time this
+#   script is run against it.
 # ============================================================
 
 ENV_NAME="FetchPA"
@@ -21,7 +46,7 @@ REFGENIE_CONFIG="$HOME/refgenie/refgenie.yaml"
 PIPELINE="$PEPATAC_DIR/pipelines/pepatac.py"
 BLACKLIST_DIR="$HOME/pepatac_blacklists"
 
-RUNNER_VERSION="1.34-all-prompts-explicit"
+RUNNER_VERSION="1.35-dm6-ucsc-reference"
 SCRIPT_VERSION="$RUNNER_VERSION"
 # Schema 3: custom-profile-only snapshot (CUSTOM_* fields).
 # Schema 4: adds genome-agnostic ANNOTATION_* fields, written for every
@@ -191,7 +216,17 @@ declare -A GENOME_ON_REFGENIE
 GENOME_ON_REFGENIE["mm10"]="yes"
 GENOME_ON_REFGENIE["hg38"]="yes"
 GENOME_ON_REFGENIE["rn7"]="no"
-GENOME_ON_REFGENIE["dm6"]="yes"
+# dm6 is deliberately NOT pulled from Refgenie: this install's Refgenie dm6
+# asset is RefSeq-accession-named (chrM = NC_024511.2), while the Boyle-Lab
+# blacklist, TxDb.Dmelanogaster.UCSC.dm6.ensGene, and PEPATAC's own
+# mitochondrial-read removal all expect UCSC names (chrM). Building dm6
+# locally from UCSC (same path already used for rn7/danRer11 below) gives a
+# natively UCSC-named FASTA/index/chrom.sizes, so nothing downstream needs
+# renaming. See run_preflight_checks' validate_mito_naming_compatibility for
+# the backstop that catches any dm6 reference (this one or a future
+# Refgenie asset) that isn't UCSC-named. Any already-downloaded RefSeq-named
+# Refgenie dm6 asset is left on disk untouched, just no longer selected.
+GENOME_ON_REFGENIE["dm6"]="no"
 GENOME_ON_REFGENIE["danRer11"]="no"
 
 declare -A UCSC_FASTA_URL
@@ -635,6 +670,31 @@ validate_genome_reference_integrity() {
     label "Validating sequence/alignment reference integrity for $GENOME..."
     validate_bowtie2_index_prefix "$genome_index"
     validate_chrom_sizes_file "$chrom_sizes"
+}
+
+# validate_mito_naming_compatibility GENOME CHROM_SIZES
+# PEPATAC's own mitochondrial-read removal and the standard Boyle-Lab/ENCODE
+# blacklists both key off the mitochondrial contig being named exactly
+# "chrM". A reference that names it some other way (e.g. a RefSeq accession
+# such as dm6's NC_024511.2) silently defeats mito-read filtering -- PEPATAC
+# reports no error, it just never finds anything to remove. Runs for every
+# genome, every mode (Refgenie or local build), so a bad reference is caught
+# here before any alignment work starts rather than discovered later in QC.
+validate_mito_naming_compatibility() {
+    local genome="$1"
+    local chrom_sizes="$2"
+    local mito_len
+
+    label "Validating mitochondrial chromosome naming for $genome..."
+    mito_len="$(awk -F'\t' '$1 == "chrM" {print $2; exit}' "$chrom_sizes")"
+
+    if [[ -z "$mito_len" ]]; then
+        die "Reference for $genome has no chromosome named 'chrM' in $chrom_sizes -- PEPATAC's mitochondrial-read removal and the standard blacklist both require this exact name, so PEPATAC would silently fail to remove mitochondrial reads against this reference. Refusing to proceed. If this is a Refgenie asset named with RefSeq accessions instead of UCSC names, select the local UCSC build for $genome instead (see Step 3b) rather than the Refgenie asset."
+    fi
+    if [[ ! "$mito_len" =~ ^[0-9]+$ ]] || (( mito_len < 1000 || mito_len > 500000 )); then
+        die "Reference for $genome has a chromosome named 'chrM' but its length ($mito_len bp, from $chrom_sizes) is implausible for a mitochondrial genome -- refusing to trust this as the real mitochondrial contig."
+    fi
+    ok "Mitochondrial chromosome present as 'chrM' ($mito_len bp)."
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -1190,9 +1250,20 @@ validate_fai_matches_chrom_sizes() {
     local fasta="$1" chrom_sizes="$2"
     local fai="${fasta}.fai" left right diff_preview
     [[ -s "$fai" ]] || die "FASTA index is missing or empty: $fai"
-    left="$(mktemp)"; right="$(mktemp)"; cut -f1,2 "$fai" > "$left"; cut -f1,2 "$chrom_sizes" > "$right"
-    if ! cmp -s "$left" "$right"; then diff_preview="$(diff -u "$left" "$right" 2>/dev/null | head -20 || true)"; rm -f "$left" "$right"; die "FASTA .fai names/lengths do not exactly match chrom.sizes."$'\n'"$diff_preview"; fi
-    rm -f "$left" "$right"; ok "FASTA .fai exactly matches chrom.sizes."
+    # Compared as a SET (sorted), not literal file order: the .fai reflects
+    # FASTA record order while chrom.sizes is independently generated by
+    # UCSC, and there's no guarantee (and no requirement -- nothing
+    # downstream depends on chrom.sizes' row order; PEPATAC derives its own
+    # chr_order.txt from the BAM header when it needs one) that the two
+    # list a genome's contigs in the same sequence. dm6's ~1870 scaffolds
+    # made this the first genome to actually hit that: same 1870
+    # names+lengths in both files, just different order, wrongly rejected
+    # as a mismatch by a literal `cmp`.
+    left="$(mktemp)"; right="$(mktemp)"
+    cut -f1,2 "$fai" | sort > "$left"
+    cut -f1,2 "$chrom_sizes" | sort > "$right"
+    if ! cmp -s "$left" "$right"; then diff_preview="$(diff -u "$left" "$right" 2>/dev/null | head -20 || true)"; rm -f "$left" "$right"; die "FASTA .fai names/lengths do not match chrom.sizes (as a set, order ignored)."$'\n'"$diff_preview"; fi
+    rm -f "$left" "$right"; ok "FASTA .fai names/lengths match chrom.sizes (as a set)."
 }
 
 validate_bowtie2_matches_fasta() {
@@ -1238,9 +1309,9 @@ RPKG
 }
 
 build_profile_annotation_assets() {
-    local assembly="$1" txdb_pkg="$2" orgdb_pkg="$3" chrom_sizes="$4" out_dir="$5"
+    local assembly="$1" txdb_pkg="$2" orgdb_pkg="$3" chrom_sizes="$4" out_dir="$5" alias_table="${6:-}"
     mkdir -p "$out_dir"
-    in_env_clean Rscript --vanilla - "$assembly" "$txdb_pkg" "$orgdb_pkg" "$chrom_sizes" "$out_dir" <<'RPROFILE'
+    in_env_clean Rscript --vanilla - "$assembly" "$txdb_pkg" "$orgdb_pkg" "$chrom_sizes" "$out_dir" "$alias_table" <<'RPROFILE'
 args <- commandArgs(trailingOnly=TRUE)
 assembly <- args[1]; txdb_pkg <- args[2]; orgdb_pkg <- args[3]; chrom_file <- args[4]; out <- args[5]
 suppressPackageStartupMessages({library(AnnotationDbi); library(GenomicFeatures); library(GenomicRanges); library(GenomeInfoDb); library(IRanges)})
@@ -1263,6 +1334,39 @@ if (is.na(reported) || !nzchar(reported)) stop("The TxDb does not report a UCSC 
 if (!identical(tolower(reported), tolower(assembly))) stop(sprintf("TxDb assembly mismatch: selected UCSC assembly '%s', but %s reports '%s'.", assembly, txdb_pkg, reported))
 chrom <- read.delim(chrom_file, header=FALSE, stringsAsFactors=FALSE, col.names=c("seqname","length"))
 if (!nrow(chrom) || anyDuplicated(chrom$seqname)) stop("chrom.sizes is empty or contains duplicate sequence names.")
+# Optional 6th argument: a verified UCSC-name <-> RefSeq-accession alias table
+# (dm6 only so far). A UCSC TxDb ("chr2L") against a RefSeq-named reference
+# ("NT_033779.5", e.g. the Refgenie dm6 asset) otherwise shares NO sequence
+# names and would be rejected below. Rename ONLY entries the table lists whose
+# UCSC name is absent from chrom.sizes and whose accession is present, and only
+# when the TxDb, the table, and chrom.sizes all agree on the length -- anything
+# else is left untouched for the existing drop-or-stop logic below. Done before
+# saveDb()/every BED is generated, so the frozen TxDb and all annotation BEDs
+# carry the reference's own names.
+ren <- character()
+alias_file <- if (length(args) >= 6 && nzchar(args[6])) args[6] else ""
+if (nzchar(alias_file)) {
+  al <- read.delim(alias_file, header=FALSE, comment.char="#", quote="", stringsAsFactors=FALSE,
+                   col.names=c("ucsc","accession","length","role","source"))
+  tx_si0 <- GenomeInfoDb::seqinfo(txdb)
+  tx_names0 <- as.character(GenomeInfoDb::seqlevels(tx_si0)); tx_len0 <- GenomeInfoDb::seqlengths(tx_si0)
+  for (k in seq_len(nrow(al))) {
+    u <- al$ucsc[k]; a <- al$accession[k]; official_len <- as.numeric(al$length[k])
+    if (!(u %in% tx_names0) || (u %in% chrom$seqname) || !(a %in% chrom$seqname)) next
+    if (a %in% tx_names0) stop(sprintf("Ambiguous TxDb: it contains BOTH '%s' and '%s' for the same chromosome; refusing to guess.", u, a))
+    ref_len <- chrom$length[match(a, chrom$seqname)]
+    tx_len <- unname(tx_len0[u])
+    if (is.na(tx_len) || tx_len != official_len || ref_len != official_len)
+      stop(sprintf("Verified alias %s -> %s disagrees on length (TxDb=%s, official table=%s, assembly=%s); refusing to treat them as the same sequence.",
+                   u, a, tx_len, official_len, ref_len))
+    ren[u] <- a
+  }
+  if (length(ren)) {
+    txdb <- GenomeInfoDb::renameSeqlevels(txdb, ren)
+    cat(sprintf("  Note: renamed %d verified TxDb sequence(s) to this reference's own names (name+length checked): %s\n",
+                length(ren), paste(sprintf("%s->%s", names(ren), ren), collapse=", ")))
+  }
+}
 si <- GenomeInfoDb::seqinfo(txdb); txseq <- as.character(GenomeInfoDb::seqlevels(si)); txlen <- GenomeInfoDb::seqlengths(si)
 missing <- setdiff(txseq, chrom$seqname)
 if (length(missing)) {
@@ -1301,6 +1405,41 @@ best <- candidates[which.max(rates)]; rate <- max(rates)
 if (!is.finite(rate) || rate < 0.70) stop(sprintf("TxDb/OrgDb compatibility is too low: %.1f%% (minimum 70%%).",100*rate))
 cat(sprintf("  Validated profile: %s; TxDb sequences in assembly 100.0%%; TxDb→OrgDb %s mapping %.1f%%.\n", assembly,best,100*rate))
 AnnotationDbi::saveDb(txdb, file.path(out,"txdb.sqlite")); AnnotationDbi::saveDb(orgdb, file.path(out,"orgdb.sqlite"))
+if (length(ren)) {
+  # A TxDb seqlevel rename is an in-memory relabel: saveDb() copies the
+  # on-disk database, which does NOT carry it (confirmed: loadDb() of the
+  # saved file shows the original UCSC names again). Persist it by relabeling
+  # every chromosome-name column of the saved copy, then RELOAD it and stop
+  # unless genes/transcripts/exons match the renamed in-memory TxDb exactly --
+  # this frozen file is what later validation and diff analysis reuse.
+  tx_path <- file.path(out,"txdb.sqlite")
+  con <- DBI::dbConnect(RSQLite::SQLite(), tx_path)
+  for (tb in DBI::dbListTables(con)) {
+    cols <- DBI::dbListFields(con, tb)
+    for (cl in cols[cols == "chrom" | grepl("_chrom$", cols)])
+      for (u in names(ren))
+        DBI::dbExecute(con, sprintf('UPDATE "%s" SET "%s" = ? WHERE "%s" = ?', tb, cl, cl), params=list(unname(ren[u]), u))
+  }
+  DBI::dbDisconnect(con)
+  persisted <- AnnotationDbi::loadDb(tx_path)
+  same_by <- function(a, b, key) {
+    a <- a[order(mcols(a)[[key]])]; b <- b[order(mcols(b)[[key]])]
+    identical(mcols(a)[[key]], mcols(b)[[key]]) && identical(as.character(seqnames(a)), as.character(seqnames(b))) &&
+      identical(start(a), start(b)) && identical(end(a), end(b)) && identical(as.character(strand(a)), as.character(strand(b)))
+  }
+  # saveDb() wrote the FULL database even though `txdb` above may have been
+  # restricted in-memory (keepSeqlevels) to the sequences this reference has,
+  # so check the renames landed in the full file, then restrict the reloaded
+  # copy the same way before comparing content.
+  persisted_lv <- GenomeInfoDb::seqlevels(persisted)
+  renames_landed <- all(unname(ren) %in% persisted_lv) && !any(names(ren) %in% persisted_lv)
+  persisted <- GenomeInfoDb::keepSeqlevels(persisted, GenomeInfoDb::seqlevels(txdb), pruning.mode="coarse")
+  persisted_ok <- renames_landed && setequal(GenomeInfoDb::seqlevels(persisted), GenomeInfoDb::seqlevels(txdb)) &&
+    same_by(suppressWarnings(GenomicFeatures::genes(persisted)), suppressWarnings(GenomicFeatures::genes(txdb)), "gene_id") &&
+    same_by(GenomicFeatures::transcripts(persisted, columns="tx_id"), GenomicFeatures::transcripts(txdb, columns="tx_id"), "tx_id") &&
+    same_by(GenomicFeatures::exons(persisted, columns="exon_id"), GenomicFeatures::exons(txdb, columns="exon_id"), "exon_id")
+  if (!isTRUE(persisted_ok)) stop("Persisting the verified TxDb sequence renames into txdb.sqlite failed verification (reloaded genes/transcripts/exons do not match the renamed TxDb).")
+}
 chrom_order <- setNames(seq_len(nrow(chrom)), chrom$seqname)
 validate_core_ranges <- function(gr, label) {
   if (!length(gr)) return(invisible(TRUE))
@@ -1796,7 +1935,18 @@ RVER
     # $stage path is also already false) -- no path re-clears this.
     ACTIVE_BUILTIN_ANNOTATION_STAGE="$stage"
 
-    if ! build_profile_annotation_assets "$genome" "$txdb_pkg" "$orgdb_pkg" "$chrom_sizes" "$stage"; then
+    # No genome currently needs an alias table here: dm6 used to (its
+    # Refgenie asset was RefSeq-accession-named, mismatching the UCSC-named
+    # TxDb.Dmelanogaster.UCSC.dm6.ensGene), but dm6 is now always built
+    # locally from UCSC (GENOME_ON_REFGENIE["dm6"]="no"), so its chrom_sizes
+    # is already UCSC-named and matches the TxDb natively. The optional
+    # alias-table parameter stays on build_profile_annotation_assets as
+    # generic infrastructure for any future genome that ends up in the same
+    # situation dm6 was in.
+    local alias_table="" builder_ok=true
+    build_profile_annotation_assets "$genome" "$txdb_pkg" "$orgdb_pkg" "$chrom_sizes" "$stage" "$alias_table" || builder_ok=false
+    [[ -z "$alias_table" ]] || rm -f "$alias_table"
+    if ! $builder_ok; then
         rm -rf "$stage"
         flock -u 201 2>/dev/null || true; exec 201>&- 2>/dev/null || true
         _fail_builtin_annotation "$genome" "build_profile_annotation_assets failed for $txdb_pkg / $orgdb_pkg."
@@ -2387,8 +2537,10 @@ compute_run_wide_fingerprint() {
         chrom_fp="missing"
     fi
 
-    if $USE_BLACKLIST && [[ -n "${BLACKLIST_PATH:-}" && -f "$BLACKLIST_PATH" ]]; then
-        bl_fp="$(sha256sum "$BLACKLIST_PATH" 2>/dev/null | awk '{print $1}')"
+    if $USE_BLACKLIST && [[ -n "${RESOLVED_BLACKLIST_PATH:-}" && -f "$RESOLVED_BLACKLIST_PATH" ]]; then
+        # Hash of what PEPATAC actually receives (deterministic gzip), so a
+        # changed blacklist, alias table, or resolver invalidates a PASS.
+        bl_fp="$(sha256sum "$RESOLVED_BLACKLIST_PATH" 2>/dev/null | awk '{print $1}')"
     else
         bl_fp="none"
     fi
@@ -2554,7 +2706,13 @@ write_run_manifest() {
         echo "Concurrent samples: ${PARALLEL_SAMPLES:-1}"
         echo "Maximum requested cores: $(( THREADS * ${PARALLEL_SAMPLES:-1} ))"
         echo "Library: $library_label"
-        echo "Blacklist: $( $USE_BLACKLIST && echo "$BLACKLIST_PATH" || echo No )"
+        if $USE_BLACKLIST; then
+            echo "Blacklist: $BLACKLIST_PATH"
+            echo "Blacklist resolved to: ${RESOLVED_BLACKLIST_PATH:-<not resolved>}"
+            echo "Blacklist verification: ${BLACKLIST_VERIFICATION_MANIFEST:-<none>}"
+        else
+            echo "Blacklist: No"
+        fi
         echo "Sample count: ${#SAMPLE_NAMES[@]}"
         echo "Selected FASTQ size: $(human_bytes "$input_bytes") ($input_bytes bytes)"
         echo ""
@@ -3456,52 +3614,885 @@ ensure_blacklist_if_requested() {
     fi
 }
 
-# validate_custom_blacklist BLACKLIST CHROM_SIZES
-# BED coordinates are 0-based half-open. Every record must be numeric,
-# positive-width, on a known sequence, and within chromosome bounds.
-validate_custom_blacklist() {
-    local blacklist="$1" chrom_sizes="$2"
-    [[ -s "$blacklist" ]] || die "Custom blacklist is missing or empty: $blacklist"
-    [[ -s "$chrom_sizes" ]] || die "Cannot validate custom blacklist without chrom.sizes: $chrom_sizes"
+# ─────────────────────────────────────────────────────────────
+# Blacklist reference compatibility
+# ─────────────────────────────────────────────────────────────
+#
+# The standard Boyle-Lab/ENCODE blacklists name chromosomes the UCSC way
+# ("chr2L"). This install's Refgenie dm6 asset, if selected, is named with
+# RefSeq accessions instead ("NT_033779.5") -- dm6 no longer defaults to
+# that asset (GENOME_ON_REFGENIE["dm6"]="no"; it's built locally from UCSC
+# instead, natively UCSC-named), but the resolver below stays as a generic
+# safety net for any reference/blacklist combination, dm6 or otherwise.
+# Handing a mismatched blacklist to PEPATAC's --blacklist unchanged means it
+# shares NOT ONE sequence name with the alignment reference, so nothing is
+# ever excluded -- and nothing says so. Only CUSTOM blacklists were ever
+# validated here; the standard download path had no compatibility check at
+# all.
+#
+# This resolves and verifies the blacklist EXACTLY ONCE per run, in
+# preflight, via an embedded resolver (same code the ChIPnRun runner
+# embeds): every blacklist chromosome must either already match
+# RUN_CHROM_SIZES by exact name (nothing renamed -- hg38/mm10/rn7/
+# danRer11 and UCSC-built genomes), or have exactly one alias verified
+# in the official table (dm6 only so far; name AND length must agree).
+# A missing chromosome, ambiguous alias, length/version disagreement,
+# malformed or out-of-range BED interval, or a PARTIAL resolution stops
+# the run -- nothing is guessed and no rows are silently dropped. The
+# resolved file is what PEPATAC receives via --blacklist; PEPATAC
+# itself is untouched.
 
-    local report reader
-    report="$(mktemp)"
-    if [[ "$(head -c2 "$blacklist" 2>/dev/null | od -An -tx1 | tr -d ' \n')" == "1f8b" ]]; then
-        reader=(gzip -cd "$blacklist")
+RESOLVED_BLACKLIST_PATH=""
+BLACKLIST_VERIFICATION_MANIFEST=""
+
+# fetchpa_python_interpreter
+# Echoes a python3/python that actually runs. `command -v` alone is not
+# trusted: some environments put a non-functional stub on PATH (e.g.
+# Windows' python3 App Execution Alias) that it finds and that then fails.
+fetchpa_python_interpreter() {
+    local candidate
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 && "$candidate" --version >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+    die "A working python3 (or python) is required on PATH for blacklist reference-compatibility resolution and was not found."
+}
+
+# fetchpa_resolve_blacklist_reference_compatibility
+# Preflight, run-once. Sets RESOLVED_BLACKLIST_PATH (gzipped, like the
+# standard blacklist PEPATAC has always been handed) and
+# BLACKLIST_VERIFICATION_MANIFEST. Dies with the resolver's own
+# diagnostic on any stop condition -- never falls back to the raw,
+# unresolved BLACKLIST_PATH.
+fetchpa_resolve_blacklist_reference_compatibility() {
+    RESOLVED_BLACKLIST_PATH=""
+    BLACKLIST_VERIFICATION_MANIFEST=""
+    $USE_BLACKLIST || return 0
+    header "Blacklist Reference Compatibility"
+
+    [[ -f "$BLACKLIST_PATH" ]] || die "Blacklist requested but file not found: $BLACKLIST_PATH"
+    [[ -s "$RUN_CHROM_SIZES" ]] || die "Cannot resolve the blacklist without the run's chrom.sizes: ${RUN_CHROM_SIZES:-<unset>}"
+
+    local py resolve_dir cache_dir stderr_log status_line official_table label_id
+    py="$(fetchpa_python_interpreter)"
+    resolve_dir="$OUTPUT_DIR/blacklist_resolved"
+    cache_dir="$BLACKLIST_DIR/resolved_cache"
+    label_id="${GENOME}_blacklist"
+    mkdir -p "$resolve_dir"
+    stderr_log="$resolve_dir/${label_id}.resolver_stderr.log"
+
+    # Materialized fresh into this run's own output tree, so the exact
+    # resolver and table that produced a run's blacklist are on record
+    # with it -- and nothing extra to deploy beside the 4 scripts.
+    fetchpa_write_blacklist_resolver_py "$resolve_dir/blacklist_resolver.py"
+    if [[ "$GENOME" == "dm6" ]]; then
+        official_table="$resolve_dir/dm6_ucsc_chromAlias.tsv"
+        fetchpa_write_dm6_chrom_alias_tsv "$official_table"
     else
-        reader=(cat "$blacklist")
+        official_table="$resolve_dir/_no_official_table.tsv"
+        printf '# no chromosomes verified for %s yet -- exact name matches only (nothing is renamed).\n' \
+            "$GENOME" > "$official_table"
     fi
 
-    if ! "${reader[@]}" | awk -F'\t' -v sizes="$chrom_sizes" -v report="$report" '
-        BEGIN {
-            while ((getline line < sizes) > 0) {
-                split(line, a, "\t")
-                if (a[1] != "" && a[2] ~ /^[0-9]+$/) len[a[1]]=a[2]
-            }
-            close(sizes)
-        }
-        /^#/ || /^track([[:space:]]|$)/ || /^browser([[:space:]]|$)/ || NF==0 {next}
-        {
-            if (NF < 3) {print "line " NR ": fewer than 3 BED columns" > report; bad=1; exit}
-            if (!($1 in len)) {print "line " NR ": unknown chromosome " $1 > report; bad=1; exit}
-            if ($2 !~ /^[0-9]+$/ || $3 !~ /^[0-9]+$/) {print "line " NR ": non-numeric start/end" > report; bad=1; exit}
-            if ($2 < 0) {print "line " NR ": start < 0" > report; bad=1; exit}
-            if ($3 <= $2) {print "line " NR ": end <= start" > report; bad=1; exit}
-            if ($3 > len[$1]) {print "line " NR ": end exceeds chromosome length" > report; bad=1; exit}
-            matched++
-        }
-        END {
-            if (!bad && matched==0) {print "no valid blacklist records matched the assembly" > report; exit 1}
-            if (bad) exit 1
-        }
-    '; then
-        local why
-        why="$(cat "$report" 2>/dev/null || true)"
-        rm -f "$report"
-        die "Custom blacklist validation failed: ${why:-unknown BED error}."
+    # `if cmd; then` (not set +e/set -e) so an expected resolver failure
+    # is handled here with its own message rather than aborting the
+    # script on the bare nonzero status.
+    if status_line="$("$py" "$resolve_dir/blacklist_resolver.py" \
+        --blacklist "$BLACKLIST_PATH" \
+        --reference-dict "$RUN_CHROM_SIZES" \
+        --official-table "$official_table" \
+        --out-dir "$resolve_dir" \
+        --cache-dir "$cache_dir" \
+        --label "$label_id" 2>"$stderr_log")"; then
+        :
+    else
+        die "Blacklist reference-compatibility resolution failed for $GENOME -- $(cat "$stderr_log")"
     fi
-    rm -f "$report"
-    ok "Custom blacklist coordinates match the selected assembly."
+
+    local resolved_plain="$resolve_dir/${label_id}.resolved.bed"
+    [[ -s "$resolved_plain" ]] || die "Blacklist resolver reported success but did not produce $resolved_plain."
+
+    # gzip -n: no embedded name/timestamp, so identical content always
+    # yields identical bytes (this file's hash feeds the resume signature).
+    RESOLVED_BLACKLIST_PATH="${resolved_plain}.gz"
+    gzip -nc "$resolved_plain" > "${RESOLVED_BLACKLIST_PATH}.part" \
+        || die "Could not gzip the resolved blacklist: $resolved_plain"
+    mv -f "${RESOLVED_BLACKLIST_PATH}.part" "$RESOLVED_BLACKLIST_PATH"
+    gzip_file_valid "$RESOLVED_BLACKLIST_PATH" || die "Resolved blacklist failed gzip verification: $RESOLVED_BLACKLIST_PATH"
+
+    BLACKLIST_VERIFICATION_MANIFEST="$resolve_dir/${label_id}.manifest.json"
+    ok "$status_line"
+}
+
+# fetchpa_write_dm6_chrom_alias_tsv OUT_PATH
+# The official dm6 chromosome alias table (source: UCSC's dm6
+# chromAlias table + dm6.chrom.sizes), restricted to the 7 chromosomes
+# the standard blacklist covers plus chrM. length_bp was independently
+# re-verified against the actual installed Refgenie dm6 asset (genome
+# digest 8baf9d24ad8f5678f0fe1f5b21a812d410755d49e3123158, "Drosophila
+# reference genome GCF_000001215.4 from NCBI") -- every length below
+# matches that installation's own .fai exactly. NC_004354.4 is chrX
+# (23,542,271 bp), NOT chr2L -- chr2L is NT_033779.5; do not "simplify"
+# this back to the wrong pairing.
+fetchpa_write_dm6_chrom_alias_tsv() {
+    cat > "$1" <<'FETCHR_DM6_ALIAS_TSV_EOF'
+# BEGIN FETCHR DM6 CHROM ALIAS TSV
+# ucsc_name	refseq_accession	length_bp	role	source
+chr2L	NT_033779.5	23513712	autosome_arm	UCSC dm6 chromAlias
+chr2R	NT_033778.4	25286936	autosome_arm	UCSC dm6 chromAlias
+chr3L	NT_037436.4	28110227	autosome_arm	UCSC dm6 chromAlias
+chr3R	NT_033777.3	32079331	autosome_arm	UCSC dm6 chromAlias
+chr4	NC_004353.4	1348131	autosome	UCSC dm6 chromAlias
+chrX	NC_004354.4	23542271	sex	UCSC dm6 chromAlias
+chrY	NC_024512.1	3667352	sex	UCSC dm6 chromAlias
+chrM	NC_024511.2	19524	mito	UCSC dm6 chromAlias
+# END FETCHR DM6 CHROM ALIAS TSV
+FETCHR_DM6_ALIAS_TSV_EOF
+}
+
+# fetchpa_write_blacklist_resolver_py OUT_PATH
+# Materializes the strict blacklist resolver (name+length, optionally
+# +sequence-checksum verification against an official alias table --
+# see fetchr_resolve_blacklist_reference_compatibility's own header for
+# what this replaces and why). Embedded rather than shipped as a
+# companion file for the same reason FetchR_chipnrun_diff_analysis.sh
+# embeds its own R library instead of shipping a .R file.
+fetchpa_write_blacklist_resolver_py() {
+    cat > "$1" <<'FETCHR_BLACKLIST_RESOLVER_PY_EOF'
+# BEGIN FETCHR BLACKLIST RESOLVER PY
+#!/usr/bin/env python3
+"""Reference-compatible blacklist resolver, shared by every ChIPnRun blacklist consumer.
+
+Replaces the old bash/R "chr-prefix shortcut" (add/strip a leading "chr"
+and accept the result if it happens to produce any overlap at all). That
+heuristic could not distinguish a correct rename from a coincidentally
+matching wrong one, and had no concept of an authoritative alias table --
+exactly what let the dm6 (Refgenie RefSeq-accession-named) vs
+Boyle-Lab/ENCODE (UCSC "chr"-named) blacklist mismatch through silently.
+
+This resolver instead requires every blacklist chromosome to match a
+verified official alias record (name + length, optionally + sequence
+checksum) before it will rename anything, and stops -- rather than
+guessing -- on anything it cannot verify. See resolve_blacklist()'s
+docstring for the exact acceptance rules.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import dataclasses
+import gzip
+import hashlib
+import json
+import os
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+RESOLVER_VERSION = "1.0.0"
+
+
+# ---------------------------------------------------------------------------
+# Official alias table
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class OfficialChromRecord:
+    ucsc_name: str
+    accession: str
+    length_bp: int
+    role: str
+    source: str
+
+
+def load_official_table(path: str) -> Dict[str, OfficialChromRecord]:
+    """Reads a TSV alias table (see fetchpa_write_dm6_chrom_alias_tsv()).
+
+    Returns a dict keyed by BOTH ucsc_name and accession, each mapping to
+    the same OfficialChromRecord -- this is deliberately not asset-type-
+    specific (it does not assume every Refgenie installation uses the
+    RefSeq column, or the UCSC column): whichever of the two names a given
+    reference actually uses is looked up the same way.
+    """
+    records: Dict[str, OfficialChromRecord] = {}
+    with open(path, "r", newline="") as fh:
+        for row in csv.reader(fh, delimiter="\t"):
+            if not row or row[0].startswith("#") or not row[0].strip():
+                continue
+            if row[0] == "ucsc_name":
+                continue
+            if len(row) < 5:
+                raise ValueError(f"{path}: malformed alias table row: {row!r}")
+            ucsc_name, accession, length_bp, role, source = row[:5]
+            rec = OfficialChromRecord(
+                ucsc_name=ucsc_name,
+                accession=accession,
+                length_bp=int(length_bp),
+                role=role,
+                source=source,
+            )
+            for key in (ucsc_name, accession):
+                if key in records and records[key] != rec:
+                    raise ValueError(
+                        f"{path}: alias table is internally ambiguous -- "
+                        f"'{key}' maps to two different records "
+                        f"({records[key]!r} vs {rec!r})"
+                    )
+                records[key] = rec
+    return records
+
+
+def official_rows(table: Dict[str, OfficialChromRecord]) -> List[OfficialChromRecord]:
+    seen = []
+    seen_ids = set()
+    for rec in table.values():
+        if id(rec) not in seen_ids:
+            seen_ids.add(id(rec))
+            seen.append(rec)
+    return seen
+
+
+# ---------------------------------------------------------------------------
+# Reference dictionaries (Bowtie2 index / Refgenie FASTA sequence names+lengths)
+# ---------------------------------------------------------------------------
+
+
+def read_fai(path: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    with open(path, "r") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            out[parts[0]] = int(parts[1])
+    return out
+
+
+def read_chrom_sizes(path: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    with open(path, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t") if "\t" in line else line.split()
+            out[parts[0]] = int(parts[1])
+    return out
+
+
+def read_reference_dict(path: str) -> Dict[str, int]:
+    """Auto-detects a samtools .fai (>=5 columns) vs a plain 2-column chrom.sizes."""
+    with open(path, "r") as fh:
+        first = ""
+        for line in fh:
+            if line.strip() and not line.startswith("#"):
+                first = line
+                break
+    n_fields = len(first.rstrip("\n").split("\t"))
+    if n_fields >= 5:
+        return read_fai(path)
+    return read_chrom_sizes(path)
+
+
+def reference_identity(reference_dict: Dict[str, int]) -> str:
+    """A stable content hash of a reference dictionary (name+length pairs only)."""
+    lines = sorted(f"{name}\t{length}" for name, length in reference_dict.items())
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Sequence checksums (normalize formatting/case, then hash)
+# ---------------------------------------------------------------------------
+
+
+def sha256_of_normalized_sequence_stream(chunks) -> str:
+    h = hashlib.sha256()
+    for chunk in chunks:
+        h.update(chunk)
+    return h.hexdigest()
+
+
+class IndexedFasta:
+    """Minimal random-access FASTA reader driven by a samtools .fai.
+
+    Only seeks/streams the requested sequence -- never loads the whole
+    (potentially multi-hundred-MB) FASTA into memory.
+    """
+
+    def __init__(self, fasta_path: str, fai_path: Optional[str] = None):
+        self.fasta_path = fasta_path
+        self.fai_path = fai_path or (fasta_path + ".fai")
+        self.index: Dict[str, Tuple[int, int, int, int]] = {}
+        with open(self.fai_path, "r") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                name, length, offset, linebases, linewidth = line.rstrip("\n").split("\t")[:5]
+                self.index[name] = (int(length), int(offset), int(linebases), int(linewidth))
+
+    def has(self, name: str) -> bool:
+        return name in self.index
+
+    def length_of(self, name: str) -> int:
+        return self.index[name][0]
+
+    def normalized_sequence_chunks(self, name: str, chunk_bases: int = 1_000_000):
+        if name not in self.index:
+            raise KeyError(f"{name}: not present in {self.fai_path}")
+        length, offset, linebases, linewidth = self.index[name]
+        if linebases <= 0 or linewidth <= 0:
+            raise ValueError(f"{name}: degenerate .fai record (linebases/linewidth <= 0)")
+        with open(self.fasta_path, "rb") as fh:
+            remaining = length
+            produced = 0
+            while remaining > 0:
+                take = min(chunk_bases, remaining)
+                full_lines, rem_bases = divmod(produced, linebases)
+                start_byte = offset + full_lines * linewidth + rem_bases
+                fh.seek(start_byte)
+                bytes_needed = 0
+                b = produced
+                left = take
+                while left > 0:
+                    col = b % linebases
+                    can_take_this_line = linebases - col
+                    step = min(can_take_this_line, left)
+                    bytes_needed += step
+                    if step == can_take_this_line and (b + step) < length:
+                        bytes_needed += (linewidth - linebases)
+                    left -= step
+                    b += step
+                raw = fh.read(bytes_needed)
+                seq_bytes = bytes(c for c in raw if c not in b"\r\n")
+                seq_bytes = seq_bytes[:take]
+                yield seq_bytes.upper()
+                produced += len(seq_bytes)
+                remaining -= len(seq_bytes)
+
+    def sha256_of_sequence(self, name: str) -> str:
+        return sha256_of_normalized_sequence_stream(self.normalized_sequence_chunks(name))
+
+
+# ---------------------------------------------------------------------------
+# Per-chromosome resolution
+# ---------------------------------------------------------------------------
+
+STATUS_PRESERVED = "preserved"
+STATUS_CONVERTED = "converted"
+STATUS_MISSING = "missing"
+STATUS_AMBIGUOUS = "ambiguous"
+STATUS_VERSION_MISMATCH = "version_mismatch"
+STATUS_SEQUENCE_MISMATCH = "sequence_mismatch"
+STATUS_UNRESOLVABLE_NAME = "unresolvable_name"
+
+STOP_STATUSES = {
+    STATUS_MISSING,
+    STATUS_AMBIGUOUS,
+    STATUS_VERSION_MISMATCH,
+    STATUS_SEQUENCE_MISMATCH,
+    STATUS_UNRESOLVABLE_NAME,
+}
+
+
+@dataclasses.dataclass
+class ChromResolution:
+    blacklist_name: str
+    resolved_name: Optional[str]
+    status: str
+    length_bp: Optional[int]
+    detail: str
+    sequence_checksum_tier: str  # "verified" | "not_performed" | "not_applicable"
+
+
+def _accession_base(accession: str) -> str:
+    return accession.split(".", 1)[0]
+
+
+def resolve_chromosome(
+    blacklist_name: str,
+    official_table: Dict[str, OfficialChromRecord],
+    reference_dict: Dict[str, int],
+) -> ChromResolution:
+    if blacklist_name not in official_table:
+        if blacklist_name in reference_dict:
+            # No rename is happening here -- the blacklist's own name is
+            # already, byte-for-byte, a name the reference itself uses. The
+            # official table exists to justify a RENAME (proving "chr2L" and
+            # "NT_033779.5" are the same sequence); it has nothing to add
+            # when no renaming is being asked of it. This is what keeps
+            # hg38/mm10/rn7/danRer11 (already "chr"-named in this
+            # installation, so a standard blacklist already matches them
+            # exactly) working with no table of their own.
+            return ChromResolution(
+                blacklist_name, blacklist_name, STATUS_PRESERVED,
+                reference_dict[blacklist_name],
+                f"{blacklist_name}: exact name match in the reference "
+                "(no official alias table entry needed -- nothing is being renamed).",
+                "not_applicable",
+            )
+        return ChromResolution(
+            blacklist_name, None, STATUS_MISSING, None,
+            f"'{blacklist_name}' is not in the official alias table and is not "
+            "present in the reference under any known alias.",
+            "not_applicable",
+        )
+
+    official = official_table[blacklist_name]
+    candidates = sorted({official.ucsc_name, official.accession})
+    matches = [c for c in candidates if c in reference_dict]
+
+    if len(matches) == 0:
+        base = _accession_base(official.accession)
+        version_hits = [
+            name for name in reference_dict
+            if _accession_base(name) == base and name != official.accession
+        ]
+        if version_hits:
+            return ChromResolution(
+                blacklist_name, None, STATUS_VERSION_MISMATCH, None,
+                f"reference has '{version_hits[0]}' but the official record for "
+                f"this chromosome is '{official.accession}' -- accession versions "
+                "disagree; refusing to assume they are the same sequence.",
+                "not_applicable",
+            )
+        return ChromResolution(
+            blacklist_name, None, STATUS_MISSING, None,
+            f"neither '{official.ucsc_name}' nor '{official.accession}' "
+            f"(the verified aliases for {blacklist_name}) is present in the reference.",
+            "not_applicable",
+        )
+
+    if len(matches) > 1:
+        return ChromResolution(
+            blacklist_name, None, STATUS_AMBIGUOUS, None,
+            f"reference contains BOTH '{matches[0]}' and '{matches[1]}' for what the "
+            f"official table treats as a single chromosome ({blacklist_name}) -- "
+            "cannot tell which one this blacklist interval refers to.",
+            "not_applicable",
+        )
+
+    target = matches[0]
+    ref_length = reference_dict[target]
+    if ref_length != official.length_bp:
+        return ChromResolution(
+            blacklist_name, target, STATUS_VERSION_MISMATCH, ref_length,
+            f"'{target}' is {ref_length} bp in the reference but the official "
+            f"record says {official.length_bp} bp -- refusing to treat these as "
+            "the same sequence.",
+            "not_applicable",
+        )
+
+    status = STATUS_PRESERVED if target == blacklist_name else STATUS_CONVERTED
+    return ChromResolution(
+        blacklist_name, target, status, ref_length,
+        f"{blacklist_name} -> {target} ({ref_length} bp, name+length verified "
+        "against the official alias table).",
+        "not_performed",
+    )
+
+
+def apply_sequence_checksum_tier(
+    resolutions: List[ChromResolution],
+    reference_fasta: IndexedFasta,
+    comparison_fasta: IndexedFasta,
+    official_table: Dict[str, OfficialChromRecord],
+) -> None:
+    """Cross-checks per-chromosome sequence identity between two independent
+    FASTAs (e.g. the installed Refgenie FASTA and an independently sourced
+    UCSC dm6 FASTA), keyed through the official table. Mutates `resolutions`
+    in place, downgrading any chromosome whose checksums disagree to
+    STATUS_SEQUENCE_MISMATCH -- equal names/lengths are not treated as
+    sufficient on their own.
+    """
+    for res in resolutions:
+        if res.status not in (STATUS_PRESERVED, STATUS_CONVERTED):
+            continue
+        official = official_table[res.blacklist_name]
+        if not (reference_fasta.has(official.accession) or reference_fasta.has(official.ucsc_name)):
+            res.sequence_checksum_tier = "not_performed"
+            continue
+        if not (comparison_fasta.has(official.accession) or comparison_fasta.has(official.ucsc_name)):
+            res.sequence_checksum_tier = "not_performed"
+            continue
+        ref_name = official.accession if reference_fasta.has(official.accession) else official.ucsc_name
+        cmp_name = official.accession if comparison_fasta.has(official.accession) else official.ucsc_name
+        ref_hash = reference_fasta.sha256_of_sequence(ref_name)
+        cmp_hash = comparison_fasta.sha256_of_sequence(cmp_name)
+        if ref_hash != cmp_hash:
+            res.status = STATUS_SEQUENCE_MISMATCH
+            res.detail = (
+                f"{res.blacklist_name}: sequence checksum disagreement between the "
+                f"reference FASTA ({ref_name}, sha256={ref_hash[:12]}...) and the "
+                f"comparison FASTA ({cmp_name}, sha256={cmp_hash[:12]}...) -- equal "
+                "names/lengths do not prove identical sequences, and they do not "
+                "here. Refusing to convert or preserve this chromosome."
+            )
+            res.sequence_checksum_tier = "verified"
+        else:
+            res.sequence_checksum_tier = "verified"
+            res.detail += f" Sequence checksum verified (sha256={ref_hash[:12]}...)."
+
+
+# ---------------------------------------------------------------------------
+# BED resolution
+# ---------------------------------------------------------------------------
+
+
+def _open_maybe_gzip(path: str, mode: str = "rt"):
+    if path.endswith(".gz"):
+        return gzip.open(path, mode)
+    with open(path, "rb") as probe:
+        magic = probe.read(2)
+    if magic == b"\x1f\x8b":
+        return gzip.open(path, mode)
+    return open(path, mode)
+
+
+@dataclasses.dataclass
+class ResolveOutcome:
+    ok: bool
+    stop_reason: Optional[str]
+    resolutions: List[ChromResolution]
+    n_intervals_in: int
+    n_intervals_out: int
+    output_bed_path: Optional[str]
+
+
+def resolve_blacklist(
+    blacklist_path: str,
+    reference_dict: Dict[str, int],
+    official_table: Dict[str, OfficialChromRecord],
+    out_bed_path: str,
+    reference_fasta: Optional[IndexedFasta] = None,
+    comparison_fasta: Optional[IndexedFasta] = None,
+) -> ResolveOutcome:
+    """Strict resolver, implementing this acceptance table:
+
+      every blacklist chromosome already matches a verified reference -> preserve names
+      every chromosome has exactly one verified alias in the reference  -> convert names
+      a chromosome is missing                                           -> stop, identify it
+      multiple reference names are possible                            -> stop, identify the ambiguity
+      accession versions or sequence checks disagree                   -> stop
+      BED coordinates are malformed or exceed sequence length          -> stop
+      only some chromosomes can be resolved                            -> stop; never silently discard the rest
+    """
+    with _open_maybe_gzip(blacklist_path, "rt") as fh:
+        rows = [line.rstrip("\n") for line in fh if line.strip() and not line.startswith(("#", "track", "browser"))]
+
+    distinct_chroms = sorted({row.split("\t", 1)[0] for row in rows})
+    resolutions = [resolve_chromosome(c, official_table, reference_dict) for c in distinct_chroms]
+
+    if reference_fasta is not None and comparison_fasta is not None:
+        apply_sequence_checksum_tier(resolutions, reference_fasta, comparison_fasta, official_table)
+
+    by_name = {r.blacklist_name: r for r in resolutions}
+    stopped = [r for r in resolutions if r.status in STOP_STATUSES]
+    if stopped:
+        reasons = "; ".join(f"{r.blacklist_name}: {r.detail}" for r in stopped)
+        n_ok = len(resolutions) - len(stopped)
+        partial_note = (
+            f" ({n_ok}/{len(resolutions)} chromosomes WOULD have resolved -- "
+            "refusing to silently drop the rest)" if n_ok else ""
+        )
+        return ResolveOutcome(
+            ok=False,
+            stop_reason=f"blacklist resolution stopped for {len(stopped)} chromosome(s){partial_note}: {reasons}",
+            resolutions=resolutions,
+            n_intervals_in=len(rows),
+            n_intervals_out=0,
+            output_bed_path=None,
+        )
+
+    out_lines = []
+    for row in rows:
+        fields = row.split("\t")
+        chrom = fields[0]
+        res = by_name[chrom]
+        try:
+            start = int(fields[1])
+            end = int(fields[2])
+        except (ValueError, IndexError):
+            return ResolveOutcome(
+                ok=False,
+                stop_reason=f"malformed BED line (non-integer start/end): {row!r}",
+                resolutions=resolutions,
+                n_intervals_in=len(rows),
+                n_intervals_out=0,
+                output_bed_path=None,
+            )
+        if start < 0 or end <= start:
+            return ResolveOutcome(
+                ok=False,
+                stop_reason=f"malformed BED line (start/end out of order): {row!r}",
+                resolutions=resolutions,
+                n_intervals_in=len(rows),
+                n_intervals_out=0,
+                output_bed_path=None,
+            )
+        if res.length_bp is not None and end > res.length_bp:
+            return ResolveOutcome(
+                ok=False,
+                stop_reason=(
+                    f"BED interval exceeds sequence length: {row!r} "
+                    f"(end={end} > {res.resolved_name} length {res.length_bp})"
+                ),
+                resolutions=resolutions,
+                n_intervals_in=len(rows),
+                n_intervals_out=0,
+                output_bed_path=None,
+            )
+        fields[0] = res.resolved_name
+        out_lines.append("\t".join(fields))
+
+    tmp_path = out_bed_path + f".tmp.{os.getpid()}"
+    opener = gzip.open if out_bed_path.endswith(".gz") else open
+    # newline="\n" pins this to plain LF regardless of host OS -- BED is a
+    # POSIX-tool format (bedtools, samtools, ...) and Python's default
+    # text-mode "w" would otherwise translate "\n" to "\r\n" on Windows.
+    with opener(tmp_path, "wt", newline="\n") as fh:
+        for line in out_lines:
+            fh.write(line + "\n")
+    os.replace(tmp_path, out_bed_path)
+
+    return ResolveOutcome(
+        ok=True,
+        stop_reason=None,
+        resolutions=resolutions,
+        n_intervals_in=len(rows),
+        n_intervals_out=len(out_lines),
+        output_bed_path=out_bed_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Manifest, caching, atomic publish
+# ---------------------------------------------------------------------------
+
+
+def sha256_of_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_manifest(
+    blacklist_path: str,
+    reference_dict: Dict[str, int],
+    official_table_path: str,
+    outcome: ResolveOutcome,
+) -> dict:
+    return {
+        "resolver_version": RESOLVER_VERSION,
+        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "reference_identity_sha256": reference_identity(reference_dict),
+        "official_table_path": os.path.abspath(official_table_path),
+        "official_table_sha256": sha256_of_file(official_table_path),
+        "input_blacklist_path": os.path.abspath(blacklist_path),
+        "input_blacklist_sha256": sha256_of_file(blacklist_path),
+        "output_blacklist_sha256": sha256_of_file(outcome.output_bed_path) if outcome.output_bed_path else None,
+        "n_intervals_in": outcome.n_intervals_in,
+        "n_intervals_out": outcome.n_intervals_out,
+        "chromosomes": [
+            {
+                "blacklist_name": r.blacklist_name,
+                "resolved_name": r.resolved_name,
+                "length_bp": r.length_bp,
+                "status": r.status,
+                "sequence_checksum_tier": r.sequence_checksum_tier,
+                "detail": r.detail,
+            }
+            for r in outcome.resolutions
+        ],
+    }
+
+
+def cache_key(reference_dict: Dict[str, int], blacklist_path: str, official_table_path: str) -> str:
+    parts = [
+        reference_identity(reference_dict),
+        sha256_of_file(blacklist_path),
+        sha256_of_file(official_table_path),
+        RESOLVER_VERSION,
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:40]
+
+
+def atomic_write_json(path: str, data: dict) -> None:
+    tmp_path = path + f".tmp.{os.getpid()}"
+    with open(tmp_path, "w", newline="\n") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp_path, path)
+
+
+def cache_lookup(
+    cache_dir: str,
+    key: str,
+    reference_dict: Dict[str, int],
+    blacklist_path: str,
+    official_table_path: str,
+) -> Optional[dict]:
+    """Returns the cached manifest dict if a cache entry exists AND its
+    recorded input checksums still match the CURRENT inputs -- a stale or
+    tampered cache entry is never trusted just because the key matched.
+    """
+    entry_dir = os.path.join(cache_dir, key)
+    manifest_path = os.path.join(entry_dir, "manifest.json")
+    bed_path = os.path.join(entry_dir, "resolved.bed")
+    if not (os.path.isfile(manifest_path) and os.path.isfile(bed_path)):
+        return None
+    with open(manifest_path, "r") as fh:
+        manifest = json.load(fh)
+    if manifest.get("resolver_version") != RESOLVER_VERSION:
+        return None
+    if manifest.get("reference_identity_sha256") != reference_identity(reference_dict):
+        return None
+    if manifest.get("input_blacklist_sha256") != sha256_of_file(blacklist_path):
+        return None
+    if manifest.get("official_table_sha256") != sha256_of_file(official_table_path):
+        return None
+    if manifest.get("output_blacklist_sha256") != sha256_of_file(bed_path):
+        return None
+    manifest["_cached_bed_path"] = bed_path
+    return manifest
+
+
+def cache_store(cache_dir: str, key: str, outcome: ResolveOutcome, manifest: dict) -> str:
+    """Publishes a fully-populated staging directory into the cache with a
+    single directory rename, so a concurrent reader (another sample racing
+    to resolve the same blacklist) never observes a partially-written
+    entry. If another process already published this exact key first, the
+    staging directory is simply discarded -- same inputs, same resolver
+    version, so the same output is expected either way.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    entry_dir = os.path.join(cache_dir, key)
+    if os.path.isdir(entry_dir):
+        return entry_dir
+    tmp_dir = os.path.join(cache_dir, f".tmp.{key}.{os.getpid()}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    with open(outcome.output_bed_path, "rb") as src, open(os.path.join(tmp_dir, "resolved.bed"), "wb") as dst:
+        dst.write(src.read())
+    with open(os.path.join(tmp_dir, "manifest.json"), "w", newline="\n") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    try:
+        os.rename(tmp_dir, entry_dir)
+    except OSError:
+        # Lost the race to another concurrent resolver -- discard our copy.
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return entry_dir
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _human_status_line(manifest: dict) -> str:
+    chroms = manifest["chromosomes"]
+    n = len(chroms)
+    checksum_tiers = {c["sequence_checksum_tier"] for c in chroms}
+    if checksum_tiers == {"verified"}:
+        tier_note = "name+length+sequence checksum"
+    elif "verified" in checksum_tiers:
+        tier_note = "name+length (+sequence checksum for some chromosomes)"
+    else:
+        tier_note = "name+length only; sequence checksum not performed"
+    kept = "all intervals retained" if manifest["n_intervals_out"] == manifest["n_intervals_in"] else (
+        f"{manifest['n_intervals_out']}/{manifest['n_intervals_in']} intervals retained"
+    )
+    return (
+        f"Blacklist verified: {n}/{n} chromosomes resolved ({tier_note}); "
+        f"{kept}; using reference-compatible blacklist."
+    )
+
+
+def _write_resolution_table(path: str, resolutions: List[ChromResolution]) -> None:
+    tmp_path = path + f".tmp.{os.getpid()}"
+    with open(tmp_path, "w", newline="\n") as fh:
+        fh.write("original_name\tresolved_name\tlength_bp\tstatus\tsequence_checksum_tier\n")
+        for r in resolutions:
+            fh.write(
+                f"{r.blacklist_name}\t{r.resolved_name or ''}\t{r.length_bp or ''}\t"
+                f"{r.status}\t{r.sequence_checksum_tier}\n"
+            )
+    os.replace(tmp_path, path)
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--blacklist", required=True)
+    p.add_argument("--reference-dict", required=True, help=".fai or chrom.sizes for the alignment reference")
+    p.add_argument("--official-table", required=True)
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--label", default="blacklist")
+    p.add_argument("--cache-dir", default=None)
+    p.add_argument("--reference-fasta", default=None, help="FASTA backing --reference-dict (for sequence checksums)")
+    p.add_argument("--comparison-fasta", default=None, help="Independent FASTA to cross-check sequences against")
+    args = p.parse_args(argv)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    reference_dict = read_reference_dict(args.reference_dict)
+    official_table = load_official_table(args.official_table)
+
+    if args.cache_dir:
+        key = cache_key(reference_dict, args.blacklist, args.official_table)
+        cached = cache_lookup(args.cache_dir, key, reference_dict, args.blacklist, args.official_table)
+        if cached is not None:
+            out_bed = os.path.join(args.out_dir, f"{args.label}.resolved.bed")
+            with open(cached["_cached_bed_path"], "rb") as src, open(out_bed + f".tmp.{os.getpid()}", "wb") as dst:
+                dst.write(src.read())
+            os.replace(out_bed + f".tmp.{os.getpid()}", out_bed)
+            table_path = os.path.join(args.out_dir, f"{args.label}.resolution_table.tsv")
+            resolutions = [
+                ChromResolution(c["blacklist_name"], c["resolved_name"], c["status"], c["length_bp"], c["detail"], c["sequence_checksum_tier"])
+                for c in cached["chromosomes"]
+            ]
+            _write_resolution_table(table_path, resolutions)
+            manifest_path = os.path.join(args.out_dir, f"{args.label}.manifest.json")
+            atomic_write_json(manifest_path, cached)
+            print(_human_status_line(cached) + " (from cache)")
+            return 0
+
+    reference_fasta = IndexedFasta(args.reference_fasta) if args.reference_fasta else None
+    comparison_fasta = IndexedFasta(args.comparison_fasta) if args.comparison_fasta else None
+
+    out_bed = os.path.join(args.out_dir, f"{args.label}.resolved.bed")
+    outcome = resolve_blacklist(
+        args.blacklist, reference_dict, official_table, out_bed,
+        reference_fasta=reference_fasta, comparison_fasta=comparison_fasta,
+    )
+
+    table_path = os.path.join(args.out_dir, f"{args.label}.resolution_table.tsv")
+    _write_resolution_table(table_path, outcome.resolutions)
+
+    if not outcome.ok:
+        sys.stderr.write(f"[STOP] {args.label}: {outcome.stop_reason}\n")
+        return 1
+
+    manifest = build_manifest(args.blacklist, reference_dict, args.official_table, outcome)
+    manifest_path = os.path.join(args.out_dir, f"{args.label}.manifest.json")
+    atomic_write_json(manifest_path, manifest)
+
+    if args.cache_dir:
+        key = cache_key(reference_dict, args.blacklist, args.official_table)
+        cache_store(args.cache_dir, key, outcome, manifest)
+
+    print(_human_status_line(manifest))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+# END FETCHR BLACKLIST RESOLVER PY
+FETCHR_BLACKLIST_RESOLVER_PY_EOF
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -3542,6 +4533,11 @@ run_preflight_checks() {
     fi
 
     validate_genome_reference_integrity "$genome_index" "$chrom_sizes"
+    # Scoped to the five built-in genomes, not user-defined custom profiles:
+    # a custom UCSC assembly is allowed to legitimately lack an assembled
+    # chrM contig (e.g. a draft assembly), which isn't the RefSeq-vs-UCSC
+    # naming bug this check exists to catch.
+    $GENOME_IS_CUSTOM || validate_mito_naming_compatibility "$GENOME" "$chrom_sizes"
     if $GENOME_IS_CUSTOM; then
         verify_file_sha256 "$LOCAL_CUSTOM_FASTA" "$LOCAL_CUSTOM_FASTA_SHA256" "custom FASTA"
         verify_file_sha256 "$LOCAL_CHROM_SIZES" "$LOCAL_CHROM_SIZES_SHA256" "custom chrom.sizes"
@@ -3567,10 +4563,13 @@ run_preflight_checks() {
 
     if $USE_BLACKLIST; then
         [[ -f "$BLACKLIST_PATH" ]] || die "Blacklist requested but file not found: $BLACKLIST_PATH"
-        if [[ "$BLACKLIST_SOURCE" == "custom" ]]; then
-            validate_custom_blacklist "$BLACKLIST_PATH" "$chrom_sizes"
-        fi
-        ok "Blacklist ready: $BLACKLIST_PATH"
+        # Reference compatibility, bounds, and malformed-interval checks
+        # (formerly done for custom blacklists only) are now enforced for
+        # EVERY blacklist by the resolver, earlier in main flow; here just
+        # confirm its output is what PEPATAC will get.
+        [[ -n "$RESOLVED_BLACKLIST_PATH" && -s "$RESOLVED_BLACKLIST_PATH" ]] \
+            || die "Blacklist requested but no resolved blacklist exists -- fetchpa_resolve_blacklist_reference_compatibility must run before preflight."
+        ok "Blacklist ready: $RESOLVED_BLACKLIST_PATH (resolved from $BLACKLIST_PATH)"
     else
         ok "Blacklist filtering not requested."
     fi
@@ -4239,8 +5238,12 @@ echo -e "  ${DIM}It will be created during preflight after confirmation.${RESET}
 header "Step 3 · Reference Genome"
 
 # Five assemblies are supported out of the box. Refgenie supplies
-# sequence/alignment assets when available. For rn7 and danRer11, the same
-# assembly is downloaded from UCSC and indexed locally. A user-defined profile option extends this to any UCSC assembly with matching TxDb and OrgDb packages.
+# sequence/alignment assets when available. For rn7, dm6, and danRer11, the
+# same assembly is downloaded from UCSC and indexed locally instead (dm6
+# because this install's Refgenie asset is RefSeq-accession-named, which
+# breaks mitochondrial-read removal and blacklist matching -- see
+# validate_mito_naming_compatibility). A user-defined profile option extends
+# this to any UCSC assembly with matching TxDb and OrgDb packages.
 GENOME_MODE="refgenie"
 GENOME_IS_CUSTOM=false
 LOCAL_BT2_INDEX=""
@@ -4856,6 +5859,11 @@ fi
 resolve_effective_genome_size "$GENOME" "$RUN_CHROM_SIZES"
 ok "Resolved genome assets once for this run (effective genome size: $RUN_GENOME_SIZE; method: $GENOME_SIZE_METHOD)."
 
+# Verify (and, where a verified alias exists, rename) the blacklist against
+# THIS run's actual reference before anything records or uses it -- the
+# manifest, resume signature, and --blacklist all take the resolved file.
+fetchpa_resolve_blacklist_reference_compatibility
+
 # Same "resolve once here" treatment for --TSS-name/--anno-name: custom
 # profiles already have validated frozen TxDb/OrgDb assets by this point
 # (verify_custom_profile_assets ran inside ensure_genome_assets); built-in
@@ -4881,11 +5889,6 @@ fi
 # diff_analysis.sh load a frozen, fingerprinted TxDb/OrgDb for a built-in
 # genome instead of whatever happens to be installed when it runs.
 write_reference_snapshot "$GENOME"
-if $GENOME_IS_CUSTOM; then
-    if $USE_BLACKLIST && [[ "$BLACKLIST_SOURCE" == "custom" ]]; then
-        validate_custom_blacklist "$BLACKLIST_PATH" "$RUN_CHROM_SIZES"
-    fi
-fi
 
 write_run_manifest
 write_resume_state
@@ -4977,8 +5980,16 @@ process_one_sample() {
         CMD+=(-Q single)
     fi
 
-    if $USE_BLACKLIST && [[ -n "$BLACKLIST_PATH" ]]; then
-        CMD+=(--blacklist "$BLACKLIST_PATH")
+    if $USE_BLACKLIST; then
+        # The RESOLVED blacklist (verified against this run's reference,
+        # renamed where a verified alias exists) -- never the raw
+        # BLACKLIST_PATH, which could share no names with the reference
+        # (historically true for dm6 against the RefSeq-named Refgenie
+        # asset; dm6 no longer defaults to that asset, but the resolver
+        # stays as a generic check for any genome/reference combination).
+        [[ -n "$RESOLVED_BLACKLIST_PATH" && -s "$RESOLVED_BLACKLIST_PATH" ]] \
+            || die "$SAMPLE: blacklist filtering is on but no resolved blacklist exists (fetchpa_resolve_blacklist_reference_compatibility did not run)."
+        CMD+=(--blacklist "$RESOLVED_BLACKLIST_PATH")
     fi
 
     # Unconditional on genome type -- conditional only on the deliberately
